@@ -9,7 +9,7 @@ import org.gradle.api.GradleException
 
 apply(plugin = "com.android.application")
 
-val appVersionName = "0.4.11-microphone-input"
+val appVersionName = "0.4.12-instrument-ui"
 val requiredCargoNdkVersion = "cargo-ndk 4.1.2"
 val rustToolchain = "stable-x86_64-pc-windows-msvc"
 val requiredRustcVersion = "rustc 1.95.0 (59807616e 2026-04-14)"
@@ -305,7 +305,7 @@ configure<ApplicationExtension> {
         applicationId = "com.ofairyo.xianzhun"
         minSdk = 26
         targetSdk = 36
-        versionCode = 15
+        versionCode = 16
         versionName = appVersionName
 
         vectorDrawables {
