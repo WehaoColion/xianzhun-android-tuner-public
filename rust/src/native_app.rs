@@ -938,13 +938,23 @@ impl AppState {
                     set_text(env, view.as_obj(), text)?;
                 }
             }
-            if old.is_none_or(|old| old.needle_cents != snapshot.needle_cents) {
+            // The first usable reading can arrive before the gauge receives
+            // its measured width. Retry after layout even if cents are stable.
+            let needle_waiting_for_layout = snapshot.needle_cents.is_some()
+                && env
+                    .call_method(self.views.needle.as_obj(), "getVisibility", "()I", &[])?
+                    .i()?
+                    != 0;
+            if needle_waiting_for_layout
+                || old.is_none_or(|old| old.needle_cents != snapshot.needle_cents)
+            {
                 sync_needle(
                     env,
                     self.views.gauge.as_obj(),
                     self.views.needle.as_obj(),
                     snapshot.needle_cents,
-                    old.is_some_and(|old| old.needle_cents.is_some()),
+                    old.is_some_and(|old| old.needle_cents.is_some())
+                        && !needle_waiting_for_layout,
                 )?;
             }
             if old.is_none_or(|old| old.note != snapshot.note || old.cents != snapshot.cents)
