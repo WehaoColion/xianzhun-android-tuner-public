@@ -1,0 +1,34 @@
+name: Rust validation
+
+on:
+  pull_request:
+    paths:
+      - 'rust/**'
+      - '.github/workflows/rust-validation.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-validation-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install repository Rust version and Android targets
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup target add --toolchain 1.95.0 aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+      - name: Run host regression tests
+        run: cargo +1.95.0 test --locked --manifest-path rust/Cargo.toml --release
+      - name: Type-check Android JNI integration
+        run: |
+          for target in aarch64-linux-android armv7-linux-androideabi x86_64-linux-android; do
+            cargo +1.95.0 check --locked --manifest-path rust/Cargo.toml --target "$target"
+          done

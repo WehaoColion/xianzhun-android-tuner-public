@@ -1,0 +1,32 @@
+# Local machine configuration and signing secrets
+/local.properties
+/release_signing.properties
+/signing.properties
+*.jks
+*.keystore
+*.p12
+*.pfx
+
+# Gradle, Android, and Rust build outputs
+/.gradle/
+**/build/
+**/.cxx/
+**/target/
+/app/src/debug/jniLibs/
+/app/src/release/jniLibs/
+*.apk
+*.aab
+
+# IDE and operating-system files
+/.agents/
+/.cod*/
+/old_apks/
+/.idea/
+*.iml
+*.log
+*.dmp
+*.hprof
+/.env
+/.env.*
+.DS_Store
+Thumbs.db

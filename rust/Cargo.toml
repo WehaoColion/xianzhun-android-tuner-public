@@ -1,0 +1,20 @@
+[package]
+name = "xianzhun_tuner"
+version = "0.4.11"
+edition = "2021"
+
+[lib]
+name = "xianzhun_tuner"
+crate-type = ["cdylib"]
+
+[dependencies]
+jni = { version = "0.21.1", default-features = false }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+codegen-units = 1
+lto = true
+panic = "abort"
+strip = "symbols"
