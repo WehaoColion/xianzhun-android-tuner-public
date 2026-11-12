@@ -1,4 +1,4 @@
-0.4.11-microphone-input - 修正低音量识别，兼容麦克风输入并显示独立收音状态。
+0.4.12-instrument-ui - 重构调音仪表、显式自动识别和固定底部操作区。
 
 # 弦准
 
@@ -8,7 +8,9 @@ Rust 编写的古典吉他安卓调音器，支持标准六弦 E2、A2、D3、G3
 
 ## 安装
 
-从 [Releases](https://github.com/WehaoColion/xianzhun-android-tuner-public/releases) 下载带版本号的正式 APK。当前版本为 `0.4.11-microphone-input`，沿用既有签名，可覆盖安装此前正式版。
+从 [Releases](https://github.com/WehaoColion/xianzhun-android-tuner-public/releases) 下载带版本号的正式 APK。目前已发布的正式 APK 为 `0.4.11-microphone-input`。源码版本为 `0.4.12-instrument-ui`，尚未发布对应签名 APK，不能将开发分支当作已发布版本。
+
+0.4.12 使用固定底部操作按钮、非交互式音准刻度和动态指针，新增显式自动识别入口，并把输入波形状态与音高结果分开显示；无有效读数时隐藏指针，避免误示已调准。尚未进行本版真机验收。
 
 0.4.11 优先使用普通麦克风输入，低增益下的微弱空弦仍可识别。输入电平独立于音高结果，区分启动、真实波形、数字静音和系统静音；有声音但没有有效琴弦音高时也能看到电平。持续常量 PCM 会尝试其他配置，保持可用录音器等待拨弦；系统静音时显示明确提示并等待恢复。此前锁定弦收音、停止取消和启动绘制修复保留。真机收音结果尚未验证，记录见 [VERIFICATION_MICROPHONE_INPUT.md](VERIFICATION_MICROPHONE_INPUT.md)。
 
@@ -62,7 +64,7 @@ cargo +stable-x86_64-pc-windows-msvc fmt --manifest-path rust/Cargo.toml --check
 .\gradlew.bat :app:lintRelease :app:assembleRelease
 ```
 
-正式产物位于 `app/build/outputs/apk/release/xianzhun-release-v0.4.11-microphone-input.apk`，包含 arm64-v8a、armeabi-v7a 和 x86_64 三个架构。构建限制仅允许带版本号的签名正式 APK，不生成 debug APK 或 AAB。
+正式产物位于 `app/build/outputs/apk/release/xianzhun-release-v0.4.12-instrument-ui.apk`，包含 arm64-v8a、armeabi-v7a 和 x86_64 三个架构。构建限制仅允许带版本号的签名正式 APK，不生成 debug APK 或 AAB。
 
 ## 版本与验证
 
