@@ -461,6 +461,16 @@ impl AppState {
         };
         if desired != current {
             Self::handle_target_selection(app, env, desired);
+        } else if current.is_none() && !auto_checked {
+            // Auto mode acts like a radio choice, not a toggle that can leave
+            // every option looking unselected while auto is still active.
+            let _ = env.call_method(
+                app.views.auto.as_obj(),
+                "setChecked",
+                "(Z)V",
+                &[JValue::Bool(1)],
+            );
+            clear_exception(env);
         }
     }
 
@@ -2343,42 +2353,6 @@ fn set_background_tint(env: &mut JNIEnv, view: &JObject, color: i32) -> JniResul
     env.call_method(
         view,
         "setBackgroundTintList",
-        "(Landroid/content/res/ColorStateList;)V",
-        &[JValue::Object(&tint)],
-    )?;
-    Ok(())
-}
-
-fn set_progress_tint(env: &mut JNIEnv, view: &JObject, color: i32) -> JniResult<()> {
-    let tint = env
-        .call_static_method(
-            "android/content/res/ColorStateList",
-            "valueOf",
-            "(I)Landroid/content/res/ColorStateList;",
-            &[JValue::Int(color)],
-        )?
-        .l()?;
-    env.call_method(
-        view,
-        "setProgressTintList",
-        "(Landroid/content/res/ColorStateList;)V",
-        &[JValue::Object(&tint)],
-    )?;
-    Ok(())
-}
-
-fn set_thumb_tint(env: &mut JNIEnv, view: &JObject, color: i32) -> JniResult<()> {
-    let tint = env
-        .call_static_method(
-            "android/content/res/ColorStateList",
-            "valueOf",
-            "(I)Landroid/content/res/ColorStateList;",
-            &[JValue::Int(color)],
-        )?
-        .l()?;
-    env.call_method(
-        view,
-        "setThumbTintList",
         "(Landroid/content/res/ColorStateList;)V",
         &[JValue::Object(&tint)],
     )?;
