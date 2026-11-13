@@ -1,4 +1,4 @@
-0.4.13-warm-brass - 以古典吉他暖木色与黄铜弧形仪表重设计调音界面，保留全部调音业务逻辑。
+0.4.14-stable-preview-sign - 预览版固定签名证书，解决每次下载的 APK 无法覆盖安装的问题。
 
 # 弦准
 
@@ -8,13 +8,15 @@ Rust 编写的古典吉他安卓调音器，支持标准六弦 E2、A2、D3、G3
 
 ## PR 预览 APK
 
-每次提交 PR 时，GitHub Actions 的 `Android preview APK` 工作流会构建可安装的测试包，并将其作为运行记录中的 Artifact 上传。打开该 PR 的 Checks 或 Actions 页面，进入成功的构建记录，下载 `xianzhun-preview-apk-<PR号>` 压缩包，解压后安装其中带当前版本号的 `xianzhun-preview-v<版本号>.apk`。
+在首次配置长期预览签名后，每次提交可信来源 PR 时，GitHub Actions 的 `Android preview APK` 工作流会构建同一固定证书签名的测试包，并将其作为运行记录中的 Artifact 上传。打开该 PR 的 Checks 或 Actions 页面，进入成功的构建记录，下载 `xianzhun-preview-apk-<PR号>` 压缩包，解压后安装其中带当前版本号的 `xianzhun-preview-v<版本号>.apk`。
 
-预览包的应用 ID 为 `com.ofairyo.xianzhun.preview`，使用 CI 临时调试签名，与官方版本并存，不可覆盖正式版，也不保证能够覆盖之前构建的预览版本。需要安装新的预览包时，如签名不一致，先卸载旧的预览包。正式发布仍必须经过仓库已有的固定生产签名指纹验证；CI 不创建或公开生产私钥。当前预览包构建不代表完成手机上的麦克风、界面和触控验收。
+预览包的应用 ID 为 `com.ofairyo.xianzhun.preview`，与正式版并存。从 0.4.14 起使用专门的**固定预览签名**：首次切换需卸载旧的临时签名预览包一次，随后保持相同签名与递增 versionCode 即可覆盖安装。缺少签名 Secret 或证书不匹配时 CI 必须失败，不允许生成另一把随机密钥。设置与离线备份见 [长期预览签名说明](docs/preview-signing.md)。正式发布仍沿用原生产签名指纹验证，CI 不创建或公开生产私钥。自动构建不等于真机麦克风、触控和 UI 验收。
 
 ## 安装
 
-从 [Releases](https://github.com/WehaoColion/xianzhun-android-tuner-public/releases) 下载带版本号的正式 APK。目前已发布的正式 APK 为 `0.4.11-microphone-input`。源码版本为 `0.4.13-warm-brass`，尚未发布对应正式签名 APK，不能将开发分支当作已发布版本。
+从 [Releases](https://github.com/WehaoColion/xianzhun-android-tuner-public/releases) 下载带版本号的正式 APK。目前已发布的正式 APK 为 `0.4.11-microphone-input`。源码版本为 `0.4.14-stable-preview-sign`，尚未发布对应正式签名 APK，不能将开发分支当作已发布版本。
+
+0.4.14 修复 PR 预览包证书反复变化的问题。新签名会通过 GitHub Actions Secret 注入与证书指纹校验，不对不受信任 Fork PR 开放；未一次性配置 Secret 前，预览 APK 构建会明确失败。正式版签名不变。
 
 0.4.13 采用第三套概念稿的暖木色、黄铜弧形音准刻度、旋转指针、渐变质感和原生按压态；避免将生成的高保真概念图当作无法交互的背景，全部绘制为可伸缩的安卓原生控件与矢量资源。沿用原有音高判断、自动/手动选弦及麦克风状态语义，手机实机显示尚待验证。
 
@@ -72,7 +74,7 @@ cargo +stable-x86_64-pc-windows-msvc fmt --manifest-path rust/Cargo.toml --check
 .\gradlew.bat :app:lintRelease :app:assembleRelease
 ```
 
-正式产物位于 `app/build/outputs/apk/release/xianzhun-release-v0.4.13-warm-brass.apk`，包含 arm64-v8a、armeabi-v7a 和 x86_64 三个架构。正式构建仍只允许固定签名与带版本号的 Release APK，不生成 debug APK 或 AAB；额外提供独立应用 ID 的预览 APK 作为 PR 验收包。
+正式产物位于 `app/build/outputs/apk/release/xianzhun-release-v0.4.14-stable-preview-sign.apk`，包含 arm64-v8a、armeabi-v7a 和 x86_64 三个架构。正式构建仍只允许固定签名与带版本号的 Release APK，不生成 debug APK 或 AAB；额外提供独立应用 ID 的预览 APK 作为 PR 验收包。
 
 ## 版本与验证
 
