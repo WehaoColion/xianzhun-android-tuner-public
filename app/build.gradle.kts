@@ -9,7 +9,7 @@ import org.gradle.api.GradleException
 
 apply(plugin = "com.android.application")
 
-val appVersionName = "0.4.12-instrument-ui"
+val appVersionName = "0.4.13-warm-brass"
 val requiredCargoNdkVersion = "cargo-ndk 4.1.2"
 val rustToolchain = System.getenv("XIANZHUN_RUST_TOOLCHAIN")
     ?.takeIf { it.isNotBlank() }
@@ -308,7 +308,7 @@ configure<ApplicationExtension> {
         applicationId = "com.ofairyo.xianzhun"
         minSdk = 26
         targetSdk = 36
-        versionCode = 16
+        versionCode = 17
         versionName = appVersionName
 
         vectorDrawables {
