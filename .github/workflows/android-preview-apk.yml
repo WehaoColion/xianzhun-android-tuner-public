@@ -15,11 +15,44 @@ concurrency:
 
 jobs:
   build-preview:
+    # Never pass a signing secret to untrusted forks. Official release
+    # signing never enters this workflow, including for owner PRs.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.user.login == 'WehaoColion')
     runs-on: windows-2025
     timeout-minutes: 50
     env:
       XIANZHUN_RUST_TOOLCHAIN: 1.95.0-x86_64-pc-windows-msvc
     steps:
+      - name: Load permanent preview signing key
+        shell: pwsh
+        env:
+          PREVIEW_SIGNING_JSON: ${{ secrets.XIANZHUN_PREVIEW_SIGNING_JSON }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:PREVIEW_SIGNING_JSON)) {
+            throw "Missing XIANZHUN_PREVIEW_SIGNING_JSON. Add the one-time signing secret in repository Settings -> Secrets and variables -> Actions. The job will not generate an incompatible debug certificate."
+          }
+          $config = $env:PREVIEW_SIGNING_JSON | ConvertFrom-Json -ErrorAction Stop
+          if ([string]::IsNullOrWhiteSpace($config.keystoreBase64) -or
+              [string]::IsNullOrWhiteSpace($config.storePassword) -or
+              [string]::IsNullOrWhiteSpace($config.keyAlias) -or
+              [string]::IsNullOrWhiteSpace($config.keyPassword)) {
+            throw "Preview signing JSON must contain keystoreBase64, storePassword, keyAlias and keyPassword."
+          }
+          $keyBytes = [Convert]::FromBase64String($config.keystoreBase64)
+          if ($keyBytes.Length -lt 512) { throw "Invalid signing keystore payload." }
+          $keyFile = Join-Path $env:RUNNER_TEMP "xianzhun-preview-signing.p12"
+          [IO.File]::WriteAllBytes($keyFile, $keyBytes)
+          Write-Output "::add-mask::$($config.storePassword)"
+          Write-Output "::add-mask::$($config.keyPassword)"
+          "XIANZHUN_PREVIEW_STORE_FILE=$keyFile" >> $env:GITHUB_ENV
+          "XIANZHUN_PREVIEW_STORE_PASSWORD=$($config.storePassword)" >> $env:GITHUB_ENV
+          "XIANZHUN_PREVIEW_KEY_ALIAS=$($config.keyAlias)" >> $env:GITHUB_ENV
+          "XIANZHUN_PREVIEW_KEY_PASSWORD=$($config.keyPassword)" >> $env:GITHUB_ENV
+          Write-Output "Permanent preview signing material loaded without exposing the private key."
+
       - name: Checkout public repository
         uses: actions/checkout@v4
         with:
@@ -83,8 +116,15 @@ jobs:
           if ($apks.Count -ne 1) { throw "Expected exactly one signed preview APK; found $($apks.Count)." }
           $apk = $apks[0].FullName
           $tools = Join-Path $env:ANDROID_SDK_ROOT "build-tools\36.0.0"
-          & (Join-Path $tools "apksigner.bat") verify --verbose --print-certs $apk
+          $verification = & (Join-Path $tools "apksigner.bat") verify --verbose --print-certs $apk
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $verification | Write-Output
+          $signer = [regex]::Match(($verification -join "`n"), "Signer #1 certificate SHA-256 digest: ([0-9a-fA-F]{64})")
+          if (-not $signer.Success) { throw "APK signer certificate was not reported." }
+          $expected = "24523de06f8f020aa37f4c91721f5e30ebd9dd84f14ac9ad0692401c5cb34e76"
+          if ($signer.Groups[1].Value.ToLowerInvariant() -ne $expected) {
+            throw "Preview APK is not signed by the pinned long-term certificate."
+          }
           $badging = & (Join-Path $tools "aapt.exe") dump badging $apk
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (-not ($badging -match "name='com.ofairyo.xianzhun.preview'")) {
@@ -107,7 +147,7 @@ jobs:
           "APK: $($apks[0].Name)" >> $env:GITHUB_STEP_SUMMARY
           "SHA-256: $hash" >> $env:GITHUB_STEP_SUMMARY
           "Package: com.ofairyo.xianzhun.preview (installs beside official release)" >> $env:GITHUB_STEP_SUMMARY
-          "Signing: ephemeral Android debug key; installable test package only, not a production release." >> $env:GITHUB_STEP_SUMMARY
+          "Signing: pinned permanent preview certificate ($expected), not the ephemeral debug key or production key." >> $env:GITHUB_STEP_SUMMARY
 
       - name: Publish downloadable APK artifact
         uses: actions/upload-artifact@v4
@@ -116,3 +156,12 @@ jobs:
           path: app/build/outputs/apk/preview/xianzhun-preview-v*.apk
           if-no-files-found: error
           retention-days: 30
+
+      - name: Remove temporary signing material
+        if: always()
+        shell: pwsh
+        run: |
+          $keyFile = Join-Path $env:RUNNER_TEMP "xianzhun-preview-signing.p12"
+          if (Test-Path $keyFile) {
+            Remove-Item -LiteralPath $keyFile -Force
+          }
