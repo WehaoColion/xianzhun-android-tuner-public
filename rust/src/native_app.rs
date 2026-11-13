@@ -45,17 +45,21 @@ const AMOTION_EVENT_ACTION_MOVE: i32 = 2;
 const AMOTION_EVENT_ACTION_CANCEL: i32 = 3;
 const AMOTION_EVENT_ACTION_POINTER_DOWN: i32 = 5;
 
-const MIDNIGHT: i32 = color(0x0e, 0x11, 0x13);
-const PANEL: i32 = color(0x18, 0x1c, 0x20);
-const PANEL_STROKE: i32 = color(0x3b, 0x42, 0x48);
-const WARM_WHITE: i32 = color(0xf7, 0xf2, 0xea);
-const MUTED_TEXT: i32 = color(0xba, 0xc2, 0xc7);
-const BRASS: i32 = color(0xd6, 0xa1, 0x4e);
-const BRASS_SOFT: i32 = color(0xe9, 0xc7, 0x7e);
-const TUNED_GREEN: i32 = color(0x63, 0xd2, 0x8f);
-const CHIP_IDLE: i32 = color(0x25, 0x2a, 0x2f);
-const CHIP_ACTIVE: i32 = color(0x4a, 0x38, 0x20);
-const CHIP_TUNED: i32 = color(0x1c, 0x48, 0x31);
+// Warm-wood and brass palette follows the classical-instrument concept.
+// Contrast and actual tuning state are prioritised over photo-real textures.
+const MIDNIGHT: i32 = color(0x16, 0x0e, 0x0c);
+const WOOD_TOP: i32 = color(0x31, 0x1e, 0x17);
+const PANEL: i32 = color(0x28, 0x19, 0x15);
+const PANEL_STROKE: i32 = color(0x82, 0x5b, 0x3d);
+const WARM_WHITE: i32 = color(0xf9, 0xe9, 0xd0);
+const MUTED_TEXT: i32 = color(0xc3, 0xa8, 0x91);
+const BRASS: i32 = color(0xc0, 0x82, 0x44);
+const BRASS_SOFT: i32 = color(0xf0, 0xca, 0x8c);
+const TUNED_GREEN: i32 = color(0x99, 0xcf, 0x82);
+const FLAT_SHARP: i32 = color(0xed, 0xa0, 0x84);
+const CHIP_IDLE: i32 = color(0x35, 0x24, 0x1e);
+const CHIP_ACTIVE: i32 = color(0x85, 0x4c, 0x2b);
+const CHIP_TUNED: i32 = color(0x2d, 0x4c, 0x31);
 
 const fn color(red: u8, green: u8, blue: u8) -> i32 {
     ((0xff_u32 << 24) | ((red as u32) << 16) | ((green as u32) << 8) | blue as u32) as i32
@@ -908,6 +912,22 @@ impl AppState {
                     &[JValue::Bool(jboolean::from(action_enabled))],
                 )?;
             }
+            if action_changed {
+                set_tactile_background(
+                    env,
+                    self.views.action.as_obj(),
+                    if action_checked { &[CHIP_ACTIVE, PANEL] } else { &[BRASS_SOFT, BRASS] },
+                    BRASS_SOFT,
+                    20.0,
+                    2,
+                )?;
+                env.call_method(
+                    self.views.action.as_obj(),
+                    "setTextColor",
+                    "(I)V",
+                    &[JValue::Int(if action_checked { WARM_WHITE } else { MIDNIGHT })],
+                )?;
+            }
             if button_changed || action_changed || enabled_changed {
                 let description = if !action_enabled {
                     "等待麦克风授权。当前未录音".to_string()
@@ -981,6 +1001,8 @@ impl AppState {
             if reading_changed {
                 let accent = if snapshot.in_tune {
                     TUNED_GREEN
+                } else if snapshot.needle_cents.is_some_and(|v| v.abs() > 4.0) {
+                    FLAT_SHARP
                 } else if snapshot.needle_cents.is_some() {
                     BRASS_SOFT
                 } else {
@@ -992,7 +1014,14 @@ impl AppState {
                     "(I)V",
                     &[JValue::Int(accent)],
                 )?;
-                set_background_tint(env, self.views.needle.as_obj(), accent)?;
+                set_gradient_background(
+                    env,
+                    self.views.needle.as_obj(),
+                    &[accent, BRASS],
+                    BRASS_SOFT,
+                    3.0,
+                    0,
+                )?;
             }
             if old.is_none_or(|old| old.input_status != snapshot.input_status) {
                 let (text, accent) = microphone_indicator(snapshot.input_status);
@@ -1011,10 +1040,17 @@ impl AppState {
                     "(Z)V",
                     &[JValue::Bool(jboolean::from(snapshot.selected_target.is_none()))],
                 )?;
-                set_background_tint(
+                set_tactile_background(
                     env,
                     self.views.auto.as_obj(),
-                    if snapshot.selected_target.is_none() { CHIP_ACTIVE } else { CHIP_IDLE },
+                    if snapshot.selected_target.is_none() {
+                        &[CHIP_ACTIVE, PANEL]
+                    } else {
+                        &[CHIP_IDLE, PANEL]
+                    },
+                    if snapshot.selected_target.is_none() { BRASS_SOFT } else { PANEL_STROKE },
+                    15.0,
+                    1,
                 )?;
             }
             for (index, chip) in self.views.chips.iter().enumerate() {
@@ -1029,7 +1065,24 @@ impl AppState {
                 }
                 let tint = chip_tint(&snapshot, index);
                 if old.is_none_or(|old| chip_tint(old, index) != tint) {
-                    set_background_tint(env, chip.as_obj(), tint)?;
+                    set_tactile_background(
+                        env,
+                        chip.as_obj(),
+                        if tint == CHIP_TUNED {
+                            &[CHIP_TUNED, PANEL]
+                        } else if tint == CHIP_ACTIVE {
+                            &[BRASS, CHIP_ACTIVE]
+                        } else {
+                            &[CHIP_IDLE, PANEL]
+                        },
+                        if tint == CHIP_TUNED { TUNED_GREEN } else if tint == CHIP_ACTIVE {
+                            BRASS_SOFT
+                        } else {
+                            PANEL_STROKE
+                        },
+                        13.0,
+                        1,
+                    )?;
                 }
             }
             if old.is_none_or(|old| old.keep_screen_on != snapshot.keep_screen_on) {
@@ -1097,16 +1150,18 @@ fn sync_needle(
             &[],
         )?.l()?;
         env.call_method(&animator, "cancel", "()V", &[])?;
+        env.call_method(needle, "setRotation", "(F)V", &[JValue::Float(0.0)])?;
         env.call_method(needle, "setVisibility", "(I)V", &[JValue::Int(4)])?;
         return Ok(());
     };
+    // A warm analogue dial rotates around a fixed, measured pivot. The arc
+    // occupies ±75°; keep the pointer just inside its endpoints.
     let width = env.call_method(gauge, "getWidth", "()I", &[])?.i()?;
-    let needle_width = env.call_method(needle, "getWidth", "()I", &[])?.i()?;
-    if width <= 0 || needle_width <= 0 {
+    let needle_height = env.call_method(needle, "getHeight", "()I", &[])?.i()?;
+    if width <= 0 || needle_height <= 0 {
         return Ok(());
     }
-    let range = ((width - needle_width).max(0) as f32) * 0.5;
-    let offset = (cents.clamp(-50.0, 50.0) / 50.0) * range;
+    let angle = (cents.clamp(-50.0, 50.0) / 50.0) * 75.0;
     env.call_method(needle, "setVisibility", "(I)V", &[JValue::Int(0)])?;
     if animate {
         let animator = env.call_method(
@@ -1117,19 +1172,19 @@ fn sync_needle(
         )?.l()?;
         env.call_method(
             &animator,
-            "translationX",
+            "rotation",
             "(F)Landroid/view/ViewPropertyAnimator;",
-            &[JValue::Float(offset)],
+            &[JValue::Float(angle)],
         )?;
         env.call_method(
             &animator,
             "setDuration",
             "(J)Landroid/view/ViewPropertyAnimator;",
-            &[JValue::Long(120)],
+            &[JValue::Long(130)],
         )?;
         env.call_method(&animator, "start", "()V", &[])?;
     } else {
-        env.call_method(needle, "setTranslationX", "(F)V", &[JValue::Float(offset)])?;
+        env.call_method(needle, "setRotation", "(F)V", &[JValue::Float(angle)])?;
     }
     Ok(())
 }
@@ -2397,6 +2452,139 @@ fn scaled_touch_slop(env: &mut JNIEnv, activity: &JObject) -> Option<f32> {
     })();
     clear_exception(env);
     result.ok().filter(|slop| *slop > 0.0)
+}
+
+// A GradientDrawable is a native Android drawable. A pressed-state pair
+// preserves tactile button feedback without raster assets or extra Java code.
+fn make_gradient_drawable<'local>(
+    env: &mut JNIEnv<'local>,
+    colors: &[i32],
+    stroke: i32,
+    radius: f32,
+    stroke_width: i32,
+) -> JniResult<JObject<'local>> {
+    let drawable = env.new_object("android/graphics/drawable/GradientDrawable", "()V", &[])?;
+    let array = env.new_int_array(colors.len() as i32)?;
+    env.set_int_array_region(&array, 0, colors)?;
+    env.call_method(
+        &drawable,
+        "setColors",
+        "([I)V",
+        &[JValue::Object(array.as_ref())],
+    )?;
+    env.call_method(&drawable, "setCornerRadius", "(F)V", &[JValue::Float(radius)])?;
+    env.call_method(
+        &drawable,
+        "setStroke",
+        "(II)V",
+        &[JValue::Int(stroke_width), JValue::Int(stroke)],
+    )?;
+    Ok(drawable)
+}
+
+fn set_gradient_background(
+    env: &mut JNIEnv,
+    view: &JObject,
+    colors: &[i32],
+    stroke: i32,
+    radius: f32,
+    stroke_width: i32,
+) -> JniResult<()> {
+    let drawable = make_gradient_drawable(env, colors, stroke, radius, stroke_width)?;
+    env.call_method(
+        view,
+        "setBackground",
+        "(Landroid/graphics/drawable/Drawable;)V",
+        &[JValue::Object(&drawable)],
+    )?;
+    Ok(())
+}
+
+fn set_tactile_background(
+    env: &mut JNIEnv,
+    view: &JObject,
+    colors: &[i32],
+    stroke: i32,
+    radius_dp: f32,
+    stroke_width: i32,
+) -> JniResult<()> {
+    let states = env.new_object("android/graphics/drawable/StateListDrawable", "()V", &[])?;
+    let pressed = env.new_int_array(1)?;
+    env.set_int_array_region(&pressed, 0, &[16842919])?; // state_pressed
+    let empty = env.new_int_array(0)?;
+    let normal = make_gradient_drawable(env, colors, stroke, radius_dp, stroke_width)?;
+    let pressed_drawable = make_gradient_drawable(
+        env,
+        &[BRASS_SOFT, CHIP_ACTIVE],
+        BRASS_SOFT,
+        radius_dp,
+        stroke_width,
+    )?;
+    env.call_method(
+        &states,
+        "addState",
+        "([ILandroid/graphics/drawable/Drawable;)V",
+        &[JValue::Object(pressed.as_ref()), JValue::Object(&pressed_drawable)],
+    )?;
+    env.call_method(
+        &states,
+        "addState",
+        "([ILandroid/graphics/drawable/Drawable;)V",
+        &[JValue::Object(empty.as_ref()), JValue::Object(&normal)],
+    )?;
+    env.call_method(
+        view,
+        "setBackground",
+        "(Landroid/graphics/drawable/Drawable;)V",
+        &[JValue::Object(&states)],
+    )?;
+    Ok(())
+}
+
+fn display_width_px(env: &mut JNIEnv, activity: &JObject) -> Option<i32> {
+    let result = (|| -> JniResult<i32> {
+        let resources = env.call_method(activity, "getResources", "()Landroid/content/res/Resources;", &[])?.l()?;
+        let metrics = env.call_method(&resources, "getDisplayMetrics", "()Landroid/util/DisplayMetrics;", &[])?.l()?;
+        env.get_field(&metrics, "widthPixels", "I")?.i()
+    })();
+    clear_exception(env);
+    result.ok().filter(|width| *width > 0)
+}
+
+fn set_serif_font(env: &mut JNIEnv, view: &JObject, bold: bool) -> JniResult<()> {
+    let family = env.new_string("serif")?;
+    let family_obj: JObject = family.into();
+    let typeface = env.call_static_method(
+        "android/graphics/Typeface",
+        "create",
+        "(Ljava/lang/String;I)Landroid/graphics/Typeface;",
+        &[JValue::Object(&family_obj), JValue::Int(if bold { 1 } else { 0 })],
+    )?.l()?;
+    env.call_method(
+        view,
+        "setTypeface",
+        "(Landroid/graphics/Typeface;)V",
+        &[JValue::Object(&typeface)],
+    )?;
+    Ok(())
+}
+
+fn drawable_resource_id(env: &mut JNIEnv, activity: &JObject, name: &str) -> JniResult<i32> {
+    let resources = env.call_method(activity, "getResources", "()Landroid/content/res/Resources;", &[])?.l()?;
+    let package = env.call_method(activity, "getPackageName", "()Ljava/lang/String;", &[])?.l()?;
+    let drawable_name = env.new_string(name)?;
+    let drawable_kind = env.new_string("drawable")?;
+    let id = env.call_method(
+        &resources,
+        "getIdentifier",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I",
+        &[
+            JValue::Object(&JObject::from(drawable_name)),
+            JValue::Object(&JObject::from(drawable_kind)),
+            JValue::Object(&package),
+        ],
+    )?.i()?;
+    Ok(id)
 }
 
 fn set_rounded_background(
