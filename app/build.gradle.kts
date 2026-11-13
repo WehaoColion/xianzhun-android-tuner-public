@@ -318,16 +318,18 @@ fun verifyGeneratedReleaseApkSigner() {
 fun configuredPreviewCertificateSha256(): String {
     val password = previewStorePassword
         ?: throw GradleException("The preview keystore password is unavailable.")
+    val keyFile = previewKeyStore ?: throw GradleException("The preview signing keystore is unavailable.")
+    val alias = previewKeyAlias ?: throw GradleException("The preview signing key alias is unavailable.")
     var lastFailure: Exception? = null
     for (storeType in listOf("PKCS12", "JKS")) {
         try {
             val keyStore = KeyStore.getInstance(storeType)
-            (previewKeyStore ?: throw GradleException("The preview signing keystore is unavailable.")).inputStream().use { input ->
+            keyFile.inputStream().use { input ->
                 keyStore.load(input, password.toCharArray())
             }
-            val certificate = keyStore.getCertificate(previewKeyAlias)
+            val certificate = keyStore.getCertificate(alias)
                 ?: throw GradleException(
-                    "Preview alias '$previewKeyAlias' is missing from ${previewKeyStore?.absolutePath ?: "(missing)"}.",
+                    "Preview alias '$alias' is missing from ${keyFile.absolutePath}.",
                 )
             return MessageDigest.getInstance("SHA-256")
                 .digest(certificate.encoded)
@@ -337,7 +339,7 @@ fun configuredPreviewCertificateSha256(): String {
         }
     }
     throw GradleException(
-        "Unable to read the preview certificate from ${previewKeyStore.absolutePath}.",
+        "Unable to read the preview certificate from ${keyFile.absolutePath}.",
         lastFailure,
     )
 }
