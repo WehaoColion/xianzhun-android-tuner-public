@@ -4,6 +4,8 @@ on:
   pull_request:
     paths:
       - 'rust/**'
+      - 'app/build.gradle.kts'
+      - '.github/workflows/android-preview-apk.yml'
       - '.github/workflows/rust-validation.yml'
 
 permissions:
@@ -32,3 +34,35 @@ jobs:
           for target in aarch64-linux-android armv7-linux-androideabi x86_64-linux-android; do
             cargo +1.95.0 check --locked --manifest-path rust/Cargo.toml --target "$target"
           done
+
+  signing-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Validate Gradle signing configuration
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --no-daemon :app:help
+      - name: Prove preview APK cannot build without permanent signing key
+        run: |
+          set +e
+          ./gradlew --no-daemon :app:assemblePreview --dry-run > /tmp/preview-signing-gate.txt 2>&1
+          result=$?
+          set -e
+          if [ "$result" -eq 0 ]; then
+            echo "SECURITY REGRESSION: preview APK allowed without signing secret"
+            exit 1
+          fi
+          if ! grep -Fq "Stable preview signing is required" /tmp/preview-signing-gate.txt; then
+            echo "Preview build failed for an unexpected reason:"
+            tail -n 45 /tmp/preview-signing-gate.txt
+            exit 1
+          fi
+          echo "Verified: missing permanent signing material prevents preview APK generation."
