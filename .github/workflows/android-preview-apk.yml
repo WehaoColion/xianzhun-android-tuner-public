@@ -105,8 +105,8 @@ jobs:
           $hash = (Get-FileHash $apk -Algorithm SHA256).Hash
           "### Signed Android preview APK" >> $env:GITHUB_STEP_SUMMARY
           "APK: $($apks[0].Name)" >> $env:GITHUB_STEP_SUMMARY
-          "SHA-256: `$hash`" >> $env:GITHUB_STEP_SUMMARY
-          "Package: `com.ofairyo.xianzhun.preview` (installs beside official release)" >> $env:GITHUB_STEP_SUMMARY
+          "SHA-256: $hash" >> $env:GITHUB_STEP_SUMMARY
+          "Package: com.ofairyo.xianzhun.preview (installs beside official release)" >> $env:GITHUB_STEP_SUMMARY
           "Signing: ephemeral Android debug key; installable test package only, not a production release." >> $env:GITHUB_STEP_SUMMARY
 
       - name: Publish downloadable APK artifact
