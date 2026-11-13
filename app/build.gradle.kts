@@ -11,7 +11,9 @@ apply(plugin = "com.android.application")
 
 val appVersionName = "0.4.12-instrument-ui"
 val requiredCargoNdkVersion = "cargo-ndk 4.1.2"
-val rustToolchain = "stable-x86_64-pc-windows-msvc"
+val rustToolchain = System.getenv("XIANZHUN_RUST_TOOLCHAIN")
+    ?.takeIf { it.isNotBlank() }
+    ?: "stable-x86_64-pc-windows-msvc"
 val requiredRustcVersion = "rustc 1.95.0 (59807616e 2026-04-14)"
 val androidBuildToolsVersion = "36.0.0"
 val expectedReleaseSignerSha256 =
