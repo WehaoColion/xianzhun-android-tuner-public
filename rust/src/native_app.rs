@@ -22,7 +22,6 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const RECORD_AUDIO: &str = "android.permission.RECORD_AUDIO";
-const PACKAGE_NAME: &str = "com.ofairyo.xianzhun";
 const PERMISSION_REQUEST_CODE: i32 = 3110;
 const FRAME_SIZE: usize = 4096;
 const UI_POLL_MILLIS: c_long = 90;
@@ -772,7 +771,20 @@ impl AppState {
                 "(Ljava/lang/String;)V",
                 &[JValue::Object(&action_obj)],
             )?;
-            let package_uri = env.new_string(format!("package:{PACKAGE_NAME}"))?;
+            // Resolve the installed identity rather than hard-coding the
+            // production package: PR previews use a separate application ID.
+            let package_name_obj = env
+                .call_method(
+                    self.activity.as_obj(),
+                    "getPackageName",
+                    "()Ljava/lang/String;",
+                    &[],
+                )?
+                .l()?;
+            let package_name: String = env
+                .get_string(&JString::from(package_name_obj))?
+                .into();
+            let package_uri = env.new_string(format!("package:{package_name}"))?;
             let package_uri_obj: JObject = package_uri.into();
             let uri = env
                 .call_static_method(
