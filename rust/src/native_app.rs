@@ -1754,7 +1754,7 @@ fn create_ui<'local>(
 
     let shell = new_linear_layout(env, activity, VERTICAL)?;
     env.call_method(&shell, "setFitsSystemWindows", "(Z)V", &[JValue::Bool(1)])?;
-    env.call_method(&shell, "setBackgroundColor", "(I)V", &[JValue::Int(MIDNIGHT)])?;
+    set_gradient_background(env, &shell, &[WOOD_TOP, PANEL, MIDNIGHT], PANEL_STROKE, 0.0, 0)?;
 
     let scroll = env.new_object(
         "android/widget/ScrollView",
@@ -1762,12 +1762,6 @@ fn create_ui<'local>(
         &[JValue::Object(activity)],
     )?;
     env.call_method(&scroll, "setFillViewport", "(Z)V", &[JValue::Bool(1)])?;
-    env.call_method(
-        &scroll,
-        "setBackgroundColor",
-        "(I)V",
-        &[JValue::Int(MIDNIGHT)],
-    )?;
     let root_description = env.new_string("弦准古典吉他调音器")?;
     let root_description_obj: JObject = root_description.into();
     env.call_method(
@@ -1803,19 +1797,20 @@ fn create_ui<'local>(
     let title = new_text_view(
         env,
         activity,
-        "弦准",
-        23.0,
-        WARM_WHITE,
+        "✦  弦准  ✦",
+        25.0,
+        BRASS_SOFT,
         true,
         GRAVITY_CENTER,
     )?;
+    set_serif_font(env, &title, true)?;
     add_with_height(
         env,
         &content,
         &title,
         MATCH_PARENT,
         WRAP_CONTENT,
-        [0, 0, 0, dp(2.0)],
+        [0, 0, 0, dp(3.0)],
     )?;
     let subtitle = new_text_view(
         env,
@@ -1835,258 +1830,229 @@ fn create_ui<'local>(
         [0, 0, 0, dp(10.0)],
     )?;
 
-    let card = new_linear_layout(env, activity, VERTICAL)?;
-    env.call_method(&card, "setGravity", "(I)V", &[JValue::Int(GRAVITY_CENTER)])?;
+
+    // Mic state is placed above the dial. Signal delivery and actual pitch
+    // recognition are distinct; silence must not be presented as a tuned note.
+    let microphone = new_text_view(
+        env, activity, "○ 麦克风待机", 12.0, BRASS_SOFT, false, GRAVITY_CENTER,
+    )?;
+    set_gradient_background(
+        env, &microphone, &[CHIP_IDLE, PANEL], PANEL_STROKE, dp(18.0) as f32, dp(1.0),
+    )?;
     env.call_method(
-        &card,
+        &microphone,
         "setPadding",
         "(IIII)V",
         &[
-            JValue::Int(dp(14.0)),
-            JValue::Int(dp(12.0)),
-            JValue::Int(dp(14.0)),
-            JValue::Int(dp(12.0)),
+            JValue::Int(dp(12.0)), JValue::Int(dp(8.0)),
+            JValue::Int(dp(12.0)), JValue::Int(dp(8.0)),
         ],
     )?;
-    set_rounded_background(env, &card, PANEL, PANEL_STROKE, dp(16.0) as f32, dp(1.0))?;
-    add_with_height(
-        env,
-        &content,
-        &card,
-        MATCH_PARENT,
-        WRAP_CONTENT,
-        [0, 0, 0, dp(14.0)],
-    )?;
+    add_with_height(env, &content, &microphone, WRAP_CONTENT, WRAP_CONTENT, [0, 0, 0, dp(12.0)])?;
 
-    let note = new_text_view(
-        env,
-        activity,
-        "待拨弦",
-        64.0,
-        WARM_WHITE,
-        true,
-        GRAVITY_CENTER,
+    let card = new_linear_layout(env, activity, VERTICAL)?;
+    env.call_method(&card, "setGravity", "(I)V", &[JValue::Int(GRAVITY_CENTER)])?;
+    env.call_method(
+        &card, "setPadding", "(IIII)V",
+        &[
+            JValue::Int(dp(11.0)), JValue::Int(dp(14.0)),
+            JValue::Int(dp(11.0)), JValue::Int(dp(12.0)),
+        ],
     )?;
+    set_gradient_background(
+        env, &card, &[WOOD_TOP, PANEL, MIDNIGHT],
+        PANEL_STROKE, dp(23.0) as f32, dp(1.0),
+    )?;
+    env.call_method(&card, "setElevation", "(F)V", &[JValue::Float(dp(4.0) as f32)])?;
+    add_with_height(env, &content, &card, MATCH_PARENT, WRAP_CONTENT, [0, 0, 0, dp(14.0)])?;
+
+    let note = new_text_view(env, activity, "待拨弦", 68.0, WARM_WHITE, true, GRAVITY_CENTER)?;
+    set_serif_font(env, &note, true)?;
     env.call_method(&note, "setSingleLine", "(Z)V", &[JValue::Bool(1)])?;
     env.call_method(
         &note,
         "setAutoSizeTextTypeUniformWithConfiguration",
         "(IIII)V",
-        &[
-            JValue::Int(30),
-            JValue::Int(64),
-            JValue::Int(2),
-            JValue::Int(TEXT_UNIT_SP),
-        ],
+        &[JValue::Int(28), JValue::Int(68), JValue::Int(2), JValue::Int(TEXT_UNIT_SP)],
     )?;
-    add_with_height(env, &card, &note, MATCH_PARENT, WRAP_CONTENT, [0; 4])?;
-    let caption = new_text_view(
-        env,
-        activity,
-        "自动识别",
-        14.0,
-        BRASS_SOFT,
-        true,
-        GRAVITY_CENTER,
-    )?;
-    add_with_height(
-        env,
-        &card,
-        &caption,
-        MATCH_PARENT,
-        WRAP_CONTENT,
-        [0, 0, 0, dp(6.0)],
-    )?;
-    let frequency = new_text_view(
-        env,
-        activity,
-        "检测 — Hz  ·  目标 — Hz",
-        13.0,
-        MUTED_TEXT,
-        false,
-        GRAVITY_CENTER,
-    )?;
-    add_with_height(
-        env,
-        &card,
-        &frequency,
-        MATCH_PARENT,
-        WRAP_CONTENT,
-        [0, 0, 0, dp(6.0)],
-    )?;
-    let cents = new_text_view(
-        env,
-        activity,
-        "— 音分",
-        24.0,
-        WARM_WHITE,
-        true,
-        GRAVITY_CENTER,
-    )?;
-    env.call_method(&cents, "setSingleLine", "(Z)V", &[JValue::Bool(1)])?;
-    env.call_method(
-        &cents,
-        "setAutoSizeTextTypeUniformWithConfiguration",
-        "(IIII)V",
-        &[
-            JValue::Int(14),
-            JValue::Int(24),
-            JValue::Int(1),
-            JValue::Int(TEXT_UNIT_SP),
-        ],
-    )?;
-    add_with_height(
-        env,
-        &card,
-        &cents,
-        MATCH_PARENT,
-        WRAP_CONTENT,
-        [0, 0, 0, dp(4.0)],
-    )?;
+    add_with_height(env, &card, &note, MATCH_PARENT, WRAP_CONTENT, [0, 0, 0, dp(1.0)])?;
 
-    // Render the scale as a real read-only instrument rather than a disabled
-    // SeekBar. The tick marks remain visible while the needle disappears in idle.
+    let caption = new_text_view(
+        env, activity, "自动识别", 15.0, BRASS_SOFT, false, GRAVITY_CENTER,
+    )?;
+    add_with_height(env, &card, &caption, MATCH_PARENT, WRAP_CONTENT, [0, 0, 0, dp(9.0)])?;
+
+    // Screen width sets a predictable dial aspect ratio and pivot geometry.
+    // The SVG-like vector is drawn by Android's own VectorDrawable engine.
+    let usable_width = display_width_px(env, activity).unwrap_or(dp(360.0)) - dp(70.0);
+    let dial_width = usable_width.max(dp(170.0)).min(dp(360.0));
+    let dial_height = ((dial_width as f32) * (200.0 / 360.0)).round() as i32;
+    let needle_height = ((dial_width as f32) * (119.0 / 360.0)).round() as i32;
+    let needle_bottom = ((dial_width as f32) * (19.0 / 360.0)).round() as i32;
+
     let gauge = env.new_object(
         "android/widget/FrameLayout",
         "(Landroid/content/Context;)V",
         &[JValue::Object(activity)],
     )?;
-    let ticks = new_linear_layout(env, activity, HORIZONTAL)?;
-    env.call_method(
-        &ticks,
-        "setImportantForAccessibility",
-        "(I)V",
-        &[JValue::Int(2)],
+    set_gradient_background(
+        env, &gauge, &[PANEL, MIDNIGHT],
+        PANEL_STROKE, dp(22.0) as f32, dp(1.0),
     )?;
-    for index in 0..=20 {
-        let major = index % 5 == 0;
-        let tick = new_text_view(
-            env,
-            activity,
-            if major { "┃" } else { "│" },
-            if major { 19.0 } else { 13.0 },
-            if index == 10 { BRASS_SOFT } else { MUTED_TEXT },
-            false,
-            GRAVITY_CENTER,
+    env.call_method(&gauge, "setClipChildren", "(Z)V", &[JValue::Bool(0)])?;
+    let gauge_art = env.new_object(
+        "android/widget/ImageView",
+        "(Landroid/content/Context;)V",
+        &[JValue::Object(activity)],
+    )?;
+    let vector_id = drawable_resource_id(env, activity, "tuner_arc_brass")?;
+    if vector_id != 0 {
+        env.call_method(
+            &gauge_art, "setImageResource", "(I)V",
+            &[JValue::Int(vector_id)],
         )?;
-        let params = linear_params(env, 0, MATCH_PARENT, Some(1.0), [0; 4])?;
-        add_view(env, &ticks, &tick, params)?;
     }
-    let ticks_params = env.new_object(
+    env.call_method(
+        &gauge_art, "setImportantForAccessibility", "(I)V", &[JValue::Int(2)],
+    )?;
+    let art_params = env.new_object(
         "android/widget/FrameLayout$LayoutParams",
         "(III)V",
         &[
-            JValue::Int(MATCH_PARENT),
-            JValue::Int(MATCH_PARENT),
+            JValue::Int(MATCH_PARENT), JValue::Int(MATCH_PARENT),
             JValue::Int(GRAVITY_CENTER),
         ],
     )?;
-    add_view(env, &gauge, &ticks, ticks_params)?;
+    add_view(env, &gauge, &gauge_art, art_params)?;
+
     let needle = env.new_object(
         "android/view/View",
         "(Landroid/content/Context;)V",
         &[JValue::Object(activity)],
     )?;
-    set_rounded_background(env, &needle, BRASS_SOFT, BRASS_SOFT, dp(2.0) as f32, 0)?;
+    let needle_width = dp(3.0);
+    set_gradient_background(
+        env, &needle, &[BRASS_SOFT, BRASS], BRASS_SOFT, dp(2.0) as f32, 0,
+    )?;
     env.call_method(&needle, "setVisibility", "(I)V", &[JValue::Int(4)])?;
     env.call_method(
-        &needle,
-        "setImportantForAccessibility",
-        "(I)V",
-        &[JValue::Int(2)],
+        &needle, "setImportantForAccessibility", "(I)V", &[JValue::Int(2)],
+    )?;
+    // The physical pivot is the needle's lower end (not its centre).
+    env.call_method(
+        &needle, "setPivotX", "(F)V", &[JValue::Float(needle_width as f32 / 2.0)],
+    )?;
+    env.call_method(
+        &needle, "setPivotY", "(F)V", &[JValue::Float(needle_height as f32)],
     )?;
     let needle_params = env.new_object(
         "android/widget/FrameLayout$LayoutParams",
         "(III)V",
         &[
-            JValue::Int(dp(3.0)),
-            JValue::Int(dp(38.0)),
-            JValue::Int(GRAVITY_CENTER),
+            JValue::Int(needle_width), JValue::Int(needle_height),
+            JValue::Int(81), // BOTTOM | CENTER_HORIZONTAL
         ],
     )?;
+    env.call_method(
+        &needle_params, "setMargins", "(IIII)V",
+        &[JValue::Int(0), JValue::Int(0), JValue::Int(0), JValue::Int(needle_bottom)],
+    )?;
     add_view(env, &gauge, &needle, needle_params)?;
-    add_with_height(
-        env,
-        &card,
-        &gauge,
-        MATCH_PARENT,
-        dp(44.0),
-        [0, 0, 0, dp(2.0)],
+
+    let pivot = env.new_object(
+        "android/view/View", "(Landroid/content/Context;)V",
+        &[JValue::Object(activity)],
     )?;
+    let pivot_diameter = dp(13.0);
+    set_gradient_background(
+        env, &pivot, &[BRASS_SOFT, CHIP_ACTIVE], BRASS_SOFT,
+        (pivot_diameter as f32) / 2.0, dp(1.0),
+    )?;
+    env.call_method(
+        &pivot, "setImportantForAccessibility", "(I)V", &[JValue::Int(2)],
+    )?;
+    let pivot_params = env.new_object(
+        "android/widget/FrameLayout$LayoutParams", "(III)V",
+        &[
+            JValue::Int(pivot_diameter), JValue::Int(pivot_diameter), JValue::Int(81),
+        ],
+    )?;
+    env.call_method(
+        &pivot_params, "setMargins", "(IIII)V",
+        &[
+            JValue::Int(0), JValue::Int(0),
+            JValue::Int(0), JValue::Int((needle_bottom - pivot_diameter / 2).max(0)),
+        ],
+    )?;
+    add_view(env, &gauge, &pivot, pivot_params)?;
+    add_with_height(env, &card, &gauge, dial_width, dial_height, [0, 0, 0, dp(2.0)])?;
+
     let scale = new_linear_layout(env, activity, HORIZONTAL)?;
-    for label in ["−50 偏低", "0 音分", "偏高 +50"] {
+    for label in ["−50", "−25", "0", "+25", "+50"] {
         let marker = new_text_view(
-            env,
-            activity,
-            label,
-            11.0,
-            MUTED_TEXT,
-            false,
-            GRAVITY_CENTER,
+            env, activity, label, 11.0,
+            if label == "0" { TUNED_GREEN } else { MUTED_TEXT },
+            false, GRAVITY_CENTER,
         )?;
-        let marker_params = linear_params(env, 0, WRAP_CONTENT, Some(1.0), [0; 4])?;
-        add_view(env, &scale, &marker, marker_params)?;
+        let params = linear_params(env, 0, WRAP_CONTENT, Some(1.0), [0; 4])?;
+        add_view(env, &scale, &marker, params)?;
     }
-    add_with_height(
-        env,
-        &card,
-        &scale,
-        MATCH_PARENT,
-        WRAP_CONTENT,
-        [0, 0, 0, dp(8.0)],
+    add_with_height(env, &card, &scale, dial_width, WRAP_CONTENT, [0, 0, 0, dp(3.0)])?;
+    let flat_sharp = new_linear_layout(env, activity, HORIZONTAL)?;
+    for label in ["偏低    ♭", "♯    偏高"] {
+        let view = new_text_view(env, activity, label, 12.0, MUTED_TEXT, false, GRAVITY_CENTER)?;
+        let params = linear_params(env, 0, WRAP_CONTENT, Some(1.0), [0; 4])?;
+        add_view(env, &flat_sharp, &view, params)?;
+    }
+    add_with_height(env, &card, &flat_sharp, dial_width, WRAP_CONTENT, [0, 0, 0, dp(12.0)])?;
+
+    let cents = new_text_view(
+        env, activity, "— 音分", 24.0, BRASS_SOFT, true, GRAVITY_CENTER,
     )?;
+    env.call_method(&cents, "setSingleLine", "(Z)V", &[JValue::Bool(1)])?;
+    env.call_method(
+        &cents, "setAutoSizeTextTypeUniformWithConfiguration", "(IIII)V",
+        &[JValue::Int(14), JValue::Int(24), JValue::Int(1), JValue::Int(TEXT_UNIT_SP)],
+    )?;
+    add_with_height(env, &card, &cents, MATCH_PARENT, WRAP_CONTENT, [0, 0, 0, dp(3.0)])?;
+
     let status = new_text_view(
-        env,
-        activity,
-        "点开始，再拨一根空弦",
-        15.0,
-        WARM_WHITE,
-        false,
-        GRAVITY_CENTER,
+        env, activity, "点开始，再拨一根空弦", 15.0, WARM_WHITE, false, GRAVITY_CENTER,
     )?;
     env.call_method(&status, "setMinLines", "(I)V", &[JValue::Int(2)])?;
-    add_with_height(
-        env,
-        &card,
-        &status,
-        MATCH_PARENT,
-        WRAP_CONTENT,
-        [0, 0, 0, dp(4.0)],
+    add_with_height(env, &card, &status, MATCH_PARENT, WRAP_CONTENT, [0, 0, 0, dp(7.0)])?;
+
+    let frequency = new_text_view(
+        env, activity, "检测 — Hz  ·  目标 — Hz", 13.0, MUTED_TEXT, false, GRAVITY_CENTER,
     )?;
-    let signal_row = new_linear_layout(env, activity, HORIZONTAL)?;
-    add_with_height(env, &card, &signal_row, MATCH_PARENT, WRAP_CONTENT, [0; 4])?;
-    let microphone = new_text_view(
-        env,
-        activity,
-        "○ 麦克风待机",
-        12.0,
-        MUTED_TEXT,
-        true,
-        GRAVITY_CENTER,
+    set_gradient_background(
+        env, &frequency, &[CHIP_IDLE, PANEL], PANEL_STROKE,
+        dp(13.0) as f32, dp(1.0),
     )?;
+    env.call_method(
+        &frequency, "setPadding", "(IIII)V",
+        &[
+            JValue::Int(dp(8.0)), JValue::Int(dp(9.0)),
+            JValue::Int(dp(8.0)), JValue::Int(dp(9.0)),
+        ],
+    )?;
+    add_with_height(env, &card, &frequency, MATCH_PARENT, WRAP_CONTENT, [0, 0, 0, dp(10.0)])?;
+
     let level = new_text_view(
-        env,
-        activity,
-        "等待声音",
-        12.0,
-        MUTED_TEXT,
-        false,
-        GRAVITY_CENTER,
+        env, activity, "等待声音", 12.0, MUTED_TEXT, false, GRAVITY_CENTER,
     )?;
-    let signal_params = linear_params(env, 0, WRAP_CONTENT, Some(1.0), [0; 4])?;
-    add_view(env, &signal_row, &microphone, signal_params)?;
-    let level_params = linear_params(env, 0, WRAP_CONTENT, Some(1.0), [0; 4])?;
-    add_view(env, &signal_row, &level, level_params)?;
+    add_with_height(env, &card, &level, MATCH_PARENT, WRAP_CONTENT, [0; 4])?;
 
     let select_title = new_text_view(
         env,
         activity,
-        "选择琴弦",
+        "◇  选择琴弦  ◇",
         17.0,
         WARM_WHITE,
         true,
         GRAVITY_CENTER,
     )?;
+    set_serif_font(env, &select_title, true)?;
     add_with_height(
         env,
         &content,
@@ -2114,7 +2080,9 @@ fn create_ui<'local>(
     )?;
 
     let auto = new_toggle(env, activity, "自动识别", 15.0, WARM_WHITE, dp(48.0))?;
-    set_rounded_background(env, &auto, CHIP_IDLE, CHIP_IDLE, dp(13.0) as f32, 0)?;
+    set_tactile_background(
+        env, &auto, &[CHIP_ACTIVE, PANEL], BRASS_SOFT, dp(16.0) as f32, dp(1.0),
+    )?;
     set_content_description(env, &auto, "自动识别琴弦，不锁定特定琴弦")?;
     add_with_height(env, &content, &auto, MATCH_PARENT, WRAP_CONTENT, [0, 0, 0, dp(8.0)])?;
 
@@ -2139,8 +2107,8 @@ fn create_ui<'local>(
 
     let mut chip_refs = Vec::with_capacity(6);
     for (index, target) in STRINGS.iter().enumerate() {
-        let label = format!("{}弦\n{}", STRINGS.len() - index, target.note);
-        let chip = new_toggle(env, activity, &label, 15.0, WARM_WHITE, dp(60.0))?;
+        let label = format!("{}\n{}弦", target.note, STRINGS.len() - index);
+        let chip = new_toggle(env, activity, &label, 16.0, WARM_WHITE, dp(62.0))?;
         env.call_method(&chip, "setMinWidth", "(I)V", &[JValue::Int(0)])?;
         env.call_method(&chip, "setMinimumWidth", "(I)V", &[JValue::Int(0)])?;
         env.call_method(
@@ -2165,14 +2133,16 @@ fn create_ui<'local>(
             "(Ljava/lang/CharSequence;)V",
             &[JValue::Object(&description_obj)],
         )?;
-        set_background_tint(env, &chip, CHIP_IDLE)?;
+        set_tactile_background(
+            env, &chip, &[CHIP_IDLE, PANEL], PANEL_STROKE, dp(13.0) as f32, dp(1.0),
+        )?;
         let parent = if index < 3 { &row_one } else { &row_two };
         let chip_params = linear_params(env, 0, WRAP_CONTENT, Some(1.0), [dp(3.0), 0, dp(3.0), 0])?;
         add_view(env, parent, &chip, chip_params)?;
         chip_refs.push(env.new_global_ref(&chip)?);
     }
 
-    let footer_text = format!("v{} · 本机处理", env!("CARGO_PKG_VERSION"));
+    let footer_text = format!("古典吉他 · 标准调弦   |   v{} · 本机处理", env!("CARGO_PKG_VERSION"));
     let footer = new_text_view(
         env,
         activity,
@@ -2186,8 +2156,14 @@ fn create_ui<'local>(
 
     // Keep the primary action reachable with one hand even when the content
     // scrolls on a smaller device or at a larger system font scale.
-    let action = new_toggle(env, activity, "开始调音", 16.0, MIDNIGHT, dp(56.0))?;
-    set_rounded_background(env, &action, BRASS, BRASS, dp(16.0) as f32, 0)?;
+    let action = new_toggle(env, activity, "开始调音", 19.0, MIDNIGHT, dp(58.0))?;
+    set_serif_font(env, &action, true)?;
+    set_tactile_background(
+        env, &action, &[BRASS_SOFT, BRASS], BRASS_SOFT, dp(20.0) as f32, dp(2.0),
+    )?;
+    env.call_method(
+        &action, "setElevation", "(F)V", &[JValue::Float(dp(6.0) as f32)],
+    )?;
     set_content_description(env, &action, "开始调音。当前未录音")?;
     add_with_height(
         env,
