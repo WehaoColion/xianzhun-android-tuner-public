@@ -1,3 +1,9 @@
+0.4.14-stable-preview-sign - 固定 PR 预览 APK 证书，解决反复卸载的问题。
+
+旧版预览 APK 使用 Windows GitHub Actions Runner 自动生成的临时 Debug 私钥，因此每个 PR 构建的相同包名 APK 证书均不相同，导致 Android 拒绝覆盖安装。本次将预览版改为独立长期 PKCS12 私钥，通过一次性 GitHub Actions Secret 注入，证书 SHA-256 固定校验，并禁止任何自动回退到临时 Debug 签名。最终 APK 经 apksigner 再次检查证书、包名和三个 ABI 后才上传。Fork PR 不注入签名私钥；正式版仍使用原独立证书。
+
+首次迁移需要卸载已有预览包一次，随后保持同一包名、固定证书和递增版本号即可覆盖安装。版本号 0.4.14，Android versionCode 18；本次仅改签名与构建配置，不改音频算法、界面或业务状态。当前仓库连接不能直接写入 GitHub Secrets，维护人需要按 docs/preview-signing.md 一次性配置密钥，然后重跑 APK 工作流。
+
 0.4.13-warm-brass - 参照第三套概念图实施暖木黄铜风格。
 
 界面采用暗木色纵深渐变、温暖的黄铜主色与低对比绒面卡片，以 Android VectorDrawable 实现可缩放的弧形刻度盘，并让实测音分驱动围绕底部枢轴旋转的精细指针。大字音名采用衬线字体，状态信息按照音名、指针、音分、操作提示、频率的阅读顺序组织。六弦按钮、自动识别及固定底部操作使用渐变和真实按压态，不再是仅供展示的概念图片。

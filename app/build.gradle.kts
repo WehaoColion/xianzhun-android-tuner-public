@@ -9,7 +9,7 @@ import org.gradle.api.GradleException
 
 apply(plugin = "com.android.application")
 
-val appVersionName = "0.4.13-warm-brass"
+val appVersionName = "0.4.14-stable-preview-sign"
 val requiredCargoNdkVersion = "cargo-ndk 4.1.2"
 val rustToolchain = System.getenv("XIANZHUN_RUST_TOOLCHAIN")
     ?.takeIf { it.isNotBlank() }
@@ -18,6 +18,10 @@ val requiredRustcVersion = "rustc 1.95.0 (59807616e 2026-04-14)"
 val androidBuildToolsVersion = "36.0.0"
 val expectedReleaseSignerSha256 =
     "f89452442d3a823088359f579961c5cfc84508cbcc8e4681bfa0045dbfc7e2ad"
+// The public fingerprint is safe to commit. The corresponding PRIVATE key
+// must only exist in XIANZHUN_PREVIEW_SIGNING_JSON (Actions Secrets).
+val expectedPreviewSignerSha256 =
+    "24523de06f8f020aa37f4c91721f5e30ebd9dd84f14ac9ad0692401c5cb34e76"
 val localProperties = Properties().apply {
     val localFile = rootProject.file("local.properties")
     if (localFile.isFile) {
@@ -228,6 +232,18 @@ val hasReleaseSigning = releaseKeyStore.isFile &&
     !releaseKeyPassword.isNullOrBlank() &&
     !releaseStorePassword.isNullOrBlank()
 
+// One stable preview key, distinct from the production release identity.
+// Never fall back to the runner-generated Android debug keystore.
+val previewKeyStore = signingValue("XIANZHUN_PREVIEW_STORE_FILE")?.let(::file)
+val previewStorePassword = signingValue("XIANZHUN_PREVIEW_STORE_PASSWORD")
+val previewKeyPassword = signingValue("XIANZHUN_PREVIEW_KEY_PASSWORD")
+val previewKeyAlias = signingValue("XIANZHUN_PREVIEW_KEY_ALIAS")
+val hasPreviewSigning =
+    previewKeyStore?.isFile == true &&
+        !previewStorePassword.isNullOrBlank() &&
+        !previewKeyPassword.isNullOrBlank() &&
+        !previewKeyAlias.isNullOrBlank()
+
 fun configuredReleaseCertificateSha256(): String {
     val password = releaseStorePassword
         ?: throw GradleException("The release keystore password is unavailable.")
@@ -299,6 +315,79 @@ fun verifyGeneratedReleaseApkSigner() {
     }
 }
 
+fun configuredPreviewCertificateSha256(): String {
+    val password = previewStorePassword
+        ?: throw GradleException("The preview keystore password is unavailable.")
+    val keyFile = previewKeyStore ?: throw GradleException("The preview signing keystore is unavailable.")
+    val alias = previewKeyAlias ?: throw GradleException("The preview signing key alias is unavailable.")
+    var lastFailure: Exception? = null
+    for (storeType in listOf("PKCS12", "JKS")) {
+        try {
+            val keyStore = KeyStore.getInstance(storeType)
+            keyFile.inputStream().use { input ->
+                keyStore.load(input, password.toCharArray())
+            }
+            val certificate = keyStore.getCertificate(alias)
+                ?: throw GradleException(
+                    "Preview alias '$alias' is missing from ${keyFile.absolutePath}.",
+                )
+            return MessageDigest.getInstance("SHA-256")
+                .digest(certificate.encoded)
+                .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+        } catch (failure: Exception) {
+            lastFailure = failure
+        }
+    }
+    throw GradleException(
+        "Unable to read the preview certificate from ${keyFile.absolutePath}.",
+        lastFailure,
+    )
+}
+
+fun verifyGeneratedPreviewApkSigner() {
+    val apk = layout.buildDirectory
+        .file("outputs/apk/preview/xianzhun-preview-v$appVersionName.apk")
+        .get()
+        .asFile
+    if (!apk.isFile) {
+        throw GradleException("Expected preview APK is missing: ${apk.absolutePath}")
+    }
+    val apkSignerJar = requireSdkRoot()
+        .resolve("build-tools/$androidBuildToolsVersion/lib/apksigner.jar")
+    val javaExecutable = File(
+        System.getProperty("java.home"),
+        if (isWindowsHost) "bin/java.exe" else "bin/java",
+    )
+    if (!apkSignerJar.isFile || !javaExecutable.isFile) {
+        throw GradleException("Pinned apksigner or Java runtime is unavailable.")
+    }
+    val result = runCommand(
+        listOf(
+            javaExecutable.absolutePath,
+            "-jar",
+            apkSignerJar.absolutePath,
+            "verify",
+            "--verbose",
+            "--print-certs",
+            apk.absolutePath,
+        ),
+    )
+    if (result.exitCode != 0) {
+        throw GradleException("Preview APK signature verification failed: ${result.output}")
+    }
+    val signer = Regex("Signer #1 certificate SHA-256 digest: ([0-9a-fA-F]{64})")
+        .find(result.output)
+        ?.groupValues
+        ?.get(1)
+        ?: throw GradleException("Preview APK signer digest was not reported by apksigner.")
+    if (!signer.equals(expectedPreviewSignerSha256, ignoreCase = true)) {
+        throw GradleException(
+            "Generated APK signer mismatch. Expected $expectedPreviewSignerSha256 but found " +
+                signer.lowercase() + ".",
+        )
+    }
+}
+
 configure<ApplicationExtension> {
     namespace = "com.ofairyo.xianzhun"
     compileSdk = 36
@@ -308,7 +397,7 @@ configure<ApplicationExtension> {
         applicationId = "com.ofairyo.xianzhun"
         minSdk = 26
         targetSdk = 36
-        versionCode = 17
+        versionCode = 18
         versionName = appVersionName
 
         vectorDrawables {
@@ -328,6 +417,14 @@ configure<ApplicationExtension> {
                 keyPassword = releaseKeyPassword
             }
         }
+        if (hasPreviewSigning) {
+            create("preview") {
+                storeFile = previewKeyStore
+                storePassword = previewStorePassword
+                keyAlias = previewKeyAlias
+                keyPassword = previewKeyPassword
+            }
+        }
     }
 
     buildTypes {
@@ -345,13 +442,13 @@ configure<ApplicationExtension> {
                 signingConfig = signingConfigs.getByName("release")
             }
         }
-        // Independent installable PR preview: never impersonate the signed
-        // production application and never bypass the release signer gate.
+        // Independent preview identity. Never use CI's ephemeral debug key,
+        // and never inherit production signing from initWith(release).
         create("preview") {
             initWith(getByName("release"))
             applicationIdSuffix = ".preview"
             versionNameSuffix = "-preview"
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = if (hasPreviewSigning) signingConfigs.getByName("preview") else null
         }
     }
 
@@ -371,6 +468,7 @@ configure<ApplicationExtension> {
 val releaseArtifactTaskName = Regex(
     "(?i)(assemble|bundle|package|install|publish).*release|release.*(bundle|package)",
 )
+val previewArtifactTaskNames = setOf("assemblePreview", "packagePreview", "installPreview")
 
 fun isForbiddenArtifactTask(taskName: String): Boolean {
     val lower = taskName.lowercase()
@@ -404,6 +502,9 @@ gradle.taskGraph.whenReady(
         val releaseArtifactRequested = allTasks.any { task ->
             task.project.path == project.path && releaseArtifactTaskName.containsMatchIn(task.name)
         }
+        val previewArtifactRequested = allTasks.any { task ->
+            task.project.path == project.path && task.name in previewArtifactTaskNames
+        }
         val nativeBuildRequested = allTasks.any { task ->
             task.project.path == project.path && task.name.startsWith("buildRust")
         }
@@ -411,6 +512,25 @@ gradle.taskGraph.whenReady(
             throw GradleException(
                 "The pinned Rust and cargo-ndk verification gate cannot be excluded.",
             )
+        }
+        if (previewArtifactRequested && isTaskExplicitlyExcluded("verifyPreviewApkSigner")) {
+            throw GradleException("The pinned preview APK signer verification gate cannot be excluded.")
+        }
+        if (previewArtifactRequested && !hasPreviewSigning) {
+            throw GradleException(
+                "Stable preview signing is required. Configure the repository Actions secret " +
+                    "XIANZHUN_PREVIEW_SIGNING_JSON and use the Android preview workflow. " +
+                    "Never fall back to a randomly generated debug key.",
+            )
+        }
+        if (previewArtifactRequested) {
+            val actualSigner = configuredPreviewCertificateSha256()
+            if (!actualSigner.equals(expectedPreviewSignerSha256, ignoreCase = true)) {
+                throw GradleException(
+                    "Preview signing certificate mismatch: expected $expectedPreviewSignerSha256 " +
+                        "but found ${actualSigner.lowercase()}. Do not rotate this key.",
+                )
+            }
         }
         if (releaseArtifactRequested && isTaskExplicitlyExcluded("verifyReleaseApkSigner")) {
             throw GradleException(
@@ -471,6 +591,21 @@ tasks.matching { it.name == "packageRelease" }.configureEach {
         verifyGeneratedReleaseApkSigner()
     }
     finalizedBy(verifyReleaseApkSigner)
+}
+
+val verifyPreviewApkSigner by tasks.registering {
+    group = "verification"
+    description = "Verifies the versioned preview APK uses the permanent pinned certificate."
+    doLast {
+        verifyGeneratedPreviewApkSigner()
+    }
+}
+
+tasks.matching { it.name == "packagePreview" }.configureEach {
+    doLast {
+        verifyGeneratedPreviewApkSigner()
+    }
+    finalizedBy(verifyPreviewApkSigner)
 }
 
 val buildRustDebug by tasks.registering(Exec::class) {
