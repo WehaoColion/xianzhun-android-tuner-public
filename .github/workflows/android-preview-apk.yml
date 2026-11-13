@@ -79,8 +79,9 @@ jobs:
       - name: Validate signer, application identity and native ABIs
         shell: pwsh
         run: |
-          $apk = "app/build/outputs/apk/preview/xianzhun-preview-v0.4.12-instrument-ui.apk"
-          if (-not (Test-Path $apk)) { throw "APK not found: $apk" }
+          $apks = @(Get-ChildItem "app/build/outputs/apk/preview" -Filter "xianzhun-preview-v*.apk" -File)
+          if ($apks.Count -ne 1) { throw "Expected exactly one signed preview APK; found $($apks.Count)." }
+          $apk = $apks[0].FullName
           $tools = Join-Path $env:ANDROID_SDK_ROOT "build-tools\36.0.0"
           & (Join-Path $tools "apksigner.bat") verify --verbose --print-certs $apk
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -103,7 +104,7 @@ jobs:
           }
           $hash = (Get-FileHash $apk -Algorithm SHA256).Hash
           "### Signed Android preview APK" >> $env:GITHUB_STEP_SUMMARY
-          "APK: `xianzhun-preview-v0.4.12-instrument-ui.apk`" >> $env:GITHUB_STEP_SUMMARY
+          "APK: $($apks[0].Name)" >> $env:GITHUB_STEP_SUMMARY
           "SHA-256: `$hash`" >> $env:GITHUB_STEP_SUMMARY
           "Package: `com.ofairyo.xianzhun.preview` (installs beside official release)" >> $env:GITHUB_STEP_SUMMARY
           "Signing: ephemeral Android debug key; installable test package only, not a production release." >> $env:GITHUB_STEP_SUMMARY
@@ -112,6 +113,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: xianzhun-preview-apk-${{ github.event.pull_request.number || github.run_number }}
-          path: app/build/outputs/apk/preview/xianzhun-preview-v0.4.12-instrument-ui.apk
+          path: app/build/outputs/apk/preview/xianzhun-preview-v*.apk
           if-no-files-found: error
           retention-days: 30
