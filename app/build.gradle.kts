@@ -50,6 +50,7 @@ val ndkRoot = localProperties.getProperty("ndk.dir")?.takeIf { it.isNotBlank() }
 val rustProjectDir = rootProject.file("rust")
 val debugJniOutDir = project.file("src/debug/jniLibs")
 val releaseJniOutDir = project.file("src/release/jniLibs")
+val previewJniOutDir = project.file("src/preview/jniLibs")
 
 fun executableNames(tool: String): List<String> {
     return if (isWindowsHost) {
@@ -342,11 +343,20 @@ configure<ApplicationExtension> {
                 signingConfig = signingConfigs.getByName("release")
             }
         }
+        // Independent installable PR preview: never impersonate the signed
+        // production application and never bypass the release signer gate.
+        create("preview") {
+            initWith(getByName("release"))
+            applicationIdSuffix = ".preview"
+            versionNameSuffix = "-preview"
+            signingConfig = signingConfigs.getByName("debug")
+        }
     }
 
     sourceSets {
         getByName("debug").jniLibs.srcDir("src/debug/jniLibs")
         getByName("release").jniLibs.srcDir("src/release/jniLibs")
+        getByName("preview").jniLibs.srcDir("src/preview/jniLibs")
     }
 
     packaging {
@@ -385,7 +395,7 @@ gradle.taskGraph.whenReady(
         }
         if (forbiddenTasks.isNotEmpty()) {
             throw GradleException(
-                "Only a signed, versioned release APK may be produced. Forbidden artifact tasks: " +
+                "Only signed, versioned production releases or isolated PR preview APKs are supported. Forbidden tasks: " +
                     forbiddenTasks.joinToString { it.path },
             )
         }
@@ -429,6 +439,7 @@ configure<AppExtension> {
         val apkName = when (buildType.name) {
             "debug" -> "xianzhun-debug-v$appVersionName-debug.apk"
             "release" -> "xianzhun-release-v$appVersionName.apk"
+            "preview" -> "xianzhun-preview-v$appVersionName.apk"
             else -> "xianzhun-${buildType.name}-v$appVersionName.apk"
         }
         outputs.all {
@@ -549,6 +560,52 @@ val buildRustRelease by tasks.registering(Exec::class) {
         )
     }
     workingDir = rustProjectDir
+}
+
+// A signed preview uses the same optimized Rust code as production, but is
+// packaged under com.ofairyo.xianzhun.preview for side-by-side testing.
+val buildRustPreview by tasks.registering(Exec::class) {
+    group = "rust"
+    description = "Builds optimized Rust libraries for the signed PR preview APK."
+    dependsOn(verifyCargoNdkTool)
+    inputs.files(fileTree(rustProjectDir) {
+        include("src/**/*.rs", "Cargo.toml", "Cargo.lock", ".cargo/**", "build.rs")
+    })
+    inputs.property("rustToolchain", requiredRustcVersion)
+    inputs.property("cargoNdk", requiredCargoNdkVersion)
+    outputs.dir(previewJniOutDir)
+    doFirst {
+        val cargoExecutable = resolveCargoExecutable()
+        val rustupExecutable = resolveRustupExecutable()
+        val cargoNdkExecutable = resolveCargoNdkExecutable(cargoExecutable)
+        val resolvedSdkRoot = requireSdkRoot()
+        val resolvedNdkRoot = requireNdkRoot()
+        delete(previewJniOutDir)
+        previewJniOutDir.mkdirs()
+        cargoHome?.let { environment("CARGO_HOME", it.absolutePath) }
+        rustupHome?.let { environment("RUSTUP_HOME", it.absolutePath) }
+        environment("PATH", toolPath(cargoExecutable, rustupExecutable, cargoNdkExecutable))
+        environment("ANDROID_HOME", resolvedSdkRoot.absolutePath)
+        environment("ANDROID_SDK_ROOT", resolvedSdkRoot.absolutePath)
+        environment("ANDROID_NDK_HOME", resolvedNdkRoot.absolutePath)
+        environment("ANDROID_NDK_ROOT", resolvedNdkRoot.absolutePath)
+        commandLine(
+            cargoExecutable.absolutePath,
+            "+$rustToolchain",
+            "ndk",
+            "-t", "arm64-v8a",
+            "-t", "armeabi-v7a",
+            "-t", "x86_64",
+            "-o", previewJniOutDir.absolutePath,
+            "-P", "26",
+            "build", "--release", "--offline",
+        )
+    }
+    workingDir = rustProjectDir
+}
+
+tasks.matching { it.name == "mergePreviewJniLibFolders" }.configureEach {
+    dependsOn(buildRustPreview)
 }
 
 tasks.matching { it.name == "mergeDebugJniLibFolders" }.configureEach {
