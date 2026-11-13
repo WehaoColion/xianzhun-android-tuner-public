@@ -882,6 +882,8 @@ impl AppState {
         let reading_changed = old.is_none_or(|old| {
             old.in_tune != snapshot.in_tune
                 || old.needle_cents.is_some() != snapshot.needle_cents.is_some()
+                || old.needle_cents.is_some_and(|c| c.abs() > 4.0)
+                    != snapshot.needle_cents.is_some_and(|c| c.abs() > 4.0)
         });
         let announcement = if self.resumed.load(Ordering::SeqCst) {
             self.accessibility
@@ -893,6 +895,7 @@ impl AppState {
         };
 
         let sync_result = env.with_local_frame(96, |env| -> JniResult<()> {
+            let density = display_density(env, self.activity.as_obj()).max(1.0);
             if button_changed {
                 set_toggle_text(env, self.views.action.as_obj(), &snapshot.button)?;
             }
@@ -918,8 +921,8 @@ impl AppState {
                     self.views.action.as_obj(),
                     if action_checked { &[CHIP_ACTIVE, PANEL] } else { &[BRASS_SOFT, BRASS] },
                     BRASS_SOFT,
-                    20.0,
-                    2,
+                    20.0 * density,
+                    density.round() as i32,
                 )?;
                 env.call_method(
                     self.views.action.as_obj(),
@@ -1019,7 +1022,7 @@ impl AppState {
                     self.views.needle.as_obj(),
                     &[accent, BRASS],
                     BRASS_SOFT,
-                    3.0,
+                    3.0 * density,
                     0,
                 )?;
             }
@@ -1049,8 +1052,8 @@ impl AppState {
                         &[CHIP_IDLE, PANEL]
                     },
                     if snapshot.selected_target.is_none() { BRASS_SOFT } else { PANEL_STROKE },
-                    15.0,
-                    1,
+                    15.0 * density,
+                    density.round() as i32,
                 )?;
             }
             for (index, chip) in self.views.chips.iter().enumerate() {
@@ -1080,8 +1083,8 @@ impl AppState {
                         } else {
                             PANEL_STROKE
                         },
-                        13.0,
-                        1,
+                        13.0 * density,
+                        density.round() as i32,
                     )?;
                 }
             }
