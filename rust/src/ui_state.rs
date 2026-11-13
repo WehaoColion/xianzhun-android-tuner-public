@@ -35,6 +35,7 @@ pub(crate) enum UiPhase {
 #[derive(Clone)]
 pub(crate) struct UiSnapshot {
     pub(crate) phase: UiPhase,
+    pub(crate) input_status: InputStatus,
     pub(crate) revision: u64,
     pub(crate) button: String,
     pub(crate) note: String,
@@ -111,6 +112,7 @@ impl UiState {
     pub(crate) fn snapshot(&self) -> UiSnapshot {
         UiSnapshot {
             phase: self.phase,
+            input_status: self.input_status,
             revision: self.revision,
             button: self.button.clone(),
             note: self.note.clone(),

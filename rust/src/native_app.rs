@@ -8,7 +8,7 @@ use crate::selection::{select_target, SelectionContext, SelectionEffect};
 use crate::tuning::STRINGS;
 use crate::ui_state::{
     permission_request_should_settle, progress_accessibility_description, AccessibilityState,
-    UiSnapshot, UiState,
+    InputStatus, UiSnapshot, UiState,
 };
 use jni::errors::Result as JniResult;
 use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
@@ -22,7 +22,6 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const RECORD_AUDIO: &str = "android.permission.RECORD_AUDIO";
-const PACKAGE_NAME: &str = "com.ofairyo.xianzhun";
 const PERMISSION_REQUEST_CODE: i32 = 3110;
 const FRAME_SIZE: usize = 4096;
 const UI_POLL_MILLIS: c_long = 90;
@@ -157,14 +156,18 @@ extern "C" {
 
 struct OverlayViews {
     root: GlobalRef,
+    scroll: GlobalRef,
     action: GlobalRef,
+    auto: GlobalRef,
     note: GlobalRef,
     caption: GlobalRef,
     frequency: GlobalRef,
     cents: GlobalRef,
     status: GlobalRef,
     level: GlobalRef,
-    progress: GlobalRef,
+    microphone: GlobalRef,
+    gauge: GlobalRef,
+    needle: GlobalRef,
     chips: [GlobalRef; 6],
     touch_slop_px: f32,
 }
@@ -436,14 +439,37 @@ impl AppState {
             clear_exception(env);
         }
 
+        let auto_checked = env
+            .call_method(app.views.auto.as_obj(), "isChecked", "()Z", &[])
+            .and_then(|value| value.z())
+            .unwrap_or(false);
+        clear_exception(env);
         let newly_checked = checked
             .iter()
             .enumerate()
             .find(|(index, value)| **value && Some(*index) != current)
             .map(|(index, _)| index);
-        let desired = newly_checked.or_else(|| current.filter(|index| checked[*index]));
+        // A freshly chosen string wins over an old auto toggle state.
+        // The explicit auto choice clears the lock without stopping capture.
+        let desired = if newly_checked.is_some() {
+            newly_checked
+        } else if auto_checked {
+            None
+        } else {
+            current.filter(|index| checked[*index])
+        };
         if desired != current {
             Self::handle_target_selection(app, env, desired);
+        } else if current.is_none() && !auto_checked {
+            // Auto mode acts like a radio choice, not a toggle that can leave
+            // every option looking unselected while auto is still active.
+            let _ = env.call_method(
+                app.views.auto.as_obj(),
+                "setChecked",
+                "(Z)V",
+                &[JValue::Bool(1)],
+            );
+            clear_exception(env);
         }
     }
 
@@ -456,6 +482,10 @@ impl AppState {
         }
         if view_contains_point(env, app.views.action.as_obj(), x, y) {
             Self::handle_action(app, env);
+            return;
+        }
+        if view_contains_point(env, app.views.auto.as_obj(), x, y) {
+            Self::handle_target_selection(app, env, None);
             return;
         }
         for (index, chip) in app.views.chips.iter().enumerate() {
@@ -508,7 +538,7 @@ impl AppState {
             return;
         }
         let _ = env.call_method(
-            app.views.root.as_obj(),
+            app.views.scroll.as_obj(),
             "scrollBy",
             "(II)V",
             &[JValue::Int(0), JValue::Int(delta.round() as i32)],
@@ -741,7 +771,20 @@ impl AppState {
                 "(Ljava/lang/String;)V",
                 &[JValue::Object(&action_obj)],
             )?;
-            let package_uri = env.new_string(format!("package:{PACKAGE_NAME}"))?;
+            // Resolve the installed identity rather than hard-coding the
+            // production package: PR previews use a separate application ID.
+            let package_name_obj = env
+                .call_method(
+                    self.activity.as_obj(),
+                    "getPackageName",
+                    "()Ljava/lang/String;",
+                    &[],
+                )?
+                .l()?;
+            let package_name: String = env
+                .get_string(&JString::from(package_name_obj))?
+                .into();
+            let package_uri = env.new_string(format!("package:{package_name}"))?;
             let package_uri_obj: JObject = package_uri.into();
             let uri = env
                 .call_static_method(
@@ -832,7 +875,6 @@ impl AppState {
         let action_changed = previous.is_none_or(|last| last.action_checked != action_checked);
         let enabled_changed = previous.is_none_or(|last| last.action_enabled != action_enabled);
         let button_changed = old.is_none_or(|old| old.button != snapshot.button);
-        let progress = needle_position(&snapshot);
         let reading_changed = old.is_none_or(|old| {
             old.in_tune != snapshot.in_tune
                 || old.needle_cents.is_some() != snapshot.needle_cents.is_some()
@@ -908,12 +950,23 @@ impl AppState {
                     set_text(env, view.as_obj(), text)?;
                 }
             }
-            if old.is_none_or(|old| needle_position(old) != progress) {
-                env.call_method(
-                    self.views.progress.as_obj(),
-                    "setProgress",
-                    "(IZ)V",
-                    &[JValue::Int(progress), JValue::Bool(0)],
+            // The first usable reading can arrive before the gauge receives
+            // its measured width. Retry after layout even if cents are stable.
+            let needle_waiting_for_layout = snapshot.needle_cents.is_some()
+                && env
+                    .call_method(self.views.needle.as_obj(), "getVisibility", "()I", &[])?
+                    .i()?
+                    != 0;
+            if needle_waiting_for_layout
+                || old.is_none_or(|old| old.needle_cents != snapshot.needle_cents)
+            {
+                sync_needle(
+                    env,
+                    self.views.gauge.as_obj(),
+                    self.views.needle.as_obj(),
+                    snapshot.needle_cents,
+                    old.is_some_and(|old| old.needle_cents.is_some())
+                        && !needle_waiting_for_layout,
                 )?;
             }
             if old.is_none_or(|old| old.note != snapshot.note || old.cents != snapshot.cents)
@@ -921,7 +974,7 @@ impl AppState {
             {
                 set_content_description(
                     env,
-                    self.views.progress.as_obj(),
+                    self.views.gauge.as_obj(),
                     &progress_accessibility_description(&snapshot),
                 )?;
             }
@@ -939,16 +992,30 @@ impl AppState {
                     "(I)V",
                     &[JValue::Int(accent)],
                 )?;
-                set_progress_tint(
-                    env,
-                    self.views.progress.as_obj(),
-                    if snapshot.needle_cents.is_some() {
-                        accent
-                    } else {
-                        PANEL_STROKE
-                    },
+                set_background_tint(env, self.views.needle.as_obj(), accent)?;
+            }
+            if old.is_none_or(|old| old.input_status != snapshot.input_status) {
+                let (text, accent) = microphone_indicator(snapshot.input_status);
+                set_text(env, self.views.microphone.as_obj(), text)?;
+                env.call_method(
+                    self.views.microphone.as_obj(),
+                    "setTextColor",
+                    "(I)V",
+                    &[JValue::Int(accent)],
                 )?;
-                set_thumb_tint(env, self.views.progress.as_obj(), accent)?;
+            }
+            if old.is_none_or(|old| old.selected_target.is_none() != snapshot.selected_target.is_none()) {
+                env.call_method(
+                    self.views.auto.as_obj(),
+                    "setChecked",
+                    "(Z)V",
+                    &[JValue::Bool(jboolean::from(snapshot.selected_target.is_none()))],
+                )?;
+                set_background_tint(
+                    env,
+                    self.views.auto.as_obj(),
+                    if snapshot.selected_target.is_none() { CHIP_ACTIVE } else { CHIP_IDLE },
+                )?;
             }
             for (index, chip) in self.views.chips.iter().enumerate() {
                 let selected = snapshot.selected_target == Some(index);
@@ -1003,11 +1070,68 @@ impl Drop for InputHandle {
     }
 }
 
-fn needle_position(snapshot: &UiSnapshot) -> i32 {
-    snapshot
-        .needle_cents
-        .map(|cents| (cents.clamp(-50.0, 50.0) + 50.0).round() as i32)
-        .unwrap_or(50)
+fn microphone_indicator(status: InputStatus) -> (&'static str, i32) {
+    match status {
+        InputStatus::Idle => ("○ 麦克风待机", MUTED_TEXT),
+        InputStatus::Starting => ("◌ 正在连接", BRASS_SOFT),
+        InputStatus::Receiving => ("● 已收到声音", BRASS_SOFT),
+        InputStatus::DigitalSilence => ("○ 已连接 · 无波形", MUTED_TEXT),
+        InputStatus::SystemSilenced => ("! 系统静音", BRASS_SOFT),
+    }
+}
+
+/// An indicator, not an editable seek bar. A missing reading is invisible,
+/// never presented as a centered (and apparently tuned) needle.
+fn sync_needle(
+    env: &mut JNIEnv,
+    gauge: &JObject,
+    needle: &JObject,
+    cents: Option<f32>,
+    animate: bool,
+) -> JniResult<()> {
+    let Some(cents) = cents else {
+        let animator = env.call_method(
+            needle,
+            "animate",
+            "()Landroid/view/ViewPropertyAnimator;",
+            &[],
+        )?.l()?;
+        env.call_method(&animator, "cancel", "()V", &[])?;
+        env.call_method(needle, "setVisibility", "(I)V", &[JValue::Int(4)])?;
+        return Ok(());
+    };
+    let width = env.call_method(gauge, "getWidth", "()I", &[])?.i()?;
+    let needle_width = env.call_method(needle, "getWidth", "()I", &[])?.i()?;
+    if width <= 0 || needle_width <= 0 {
+        return Ok(());
+    }
+    let range = ((width - needle_width).max(0) as f32) * 0.5;
+    let offset = (cents.clamp(-50.0, 50.0) / 50.0) * range;
+    env.call_method(needle, "setVisibility", "(I)V", &[JValue::Int(0)])?;
+    if animate {
+        let animator = env.call_method(
+            needle,
+            "animate",
+            "()Landroid/view/ViewPropertyAnimator;",
+            &[],
+        )?.l()?;
+        env.call_method(
+            &animator,
+            "translationX",
+            "(F)Landroid/view/ViewPropertyAnimator;",
+            &[JValue::Float(offset)],
+        )?;
+        env.call_method(
+            &animator,
+            "setDuration",
+            "(J)Landroid/view/ViewPropertyAnimator;",
+            &[JValue::Long(120)],
+        )?;
+        env.call_method(&animator, "start", "()V", &[])?;
+    } else {
+        env.call_method(needle, "setTranslationX", "(F)V", &[JValue::Float(offset)])?;
+    }
+    Ok(())
 }
 
 fn chip_tint(snapshot: &UiSnapshot, index: usize) -> i32 {
@@ -1573,13 +1697,16 @@ fn create_ui<'local>(
     let density = display_density(env, activity).max(1.0);
     let dp = |value: f32| (value * density).round() as i32;
 
+    let shell = new_linear_layout(env, activity, VERTICAL)?;
+    env.call_method(&shell, "setFitsSystemWindows", "(Z)V", &[JValue::Bool(1)])?;
+    env.call_method(&shell, "setBackgroundColor", "(I)V", &[JValue::Int(MIDNIGHT)])?;
+
     let scroll = env.new_object(
         "android/widget/ScrollView",
         "(Landroid/content/Context;)V",
         &[JValue::Object(activity)],
     )?;
     env.call_method(&scroll, "setFillViewport", "(Z)V", &[JValue::Bool(1)])?;
-    env.call_method(&scroll, "setFitsSystemWindows", "(Z)V", &[JValue::Bool(1)])?;
     env.call_method(
         &scroll,
         "setBackgroundColor",
@@ -1589,11 +1716,13 @@ fn create_ui<'local>(
     let root_description = env.new_string("弦准古典吉他调音器")?;
     let root_description_obj: JObject = root_description.into();
     env.call_method(
-        &scroll,
+        &shell,
         "setContentDescription",
         "(Ljava/lang/CharSequence;)V",
         &[JValue::Object(&root_description_obj)],
     )?;
+    let scroll_params = linear_params(env, MATCH_PARENT, 0, Some(1.0), [0; 4])?;
+    add_view(env, &shell, &scroll, scroll_params)?;
 
     let content = new_linear_layout(env, activity, VERTICAL)?;
     env.call_method(
@@ -1620,7 +1749,7 @@ fn create_ui<'local>(
         env,
         activity,
         "弦准",
-        26.0,
+        23.0,
         WARM_WHITE,
         true,
         GRAVITY_CENTER,
@@ -1637,7 +1766,7 @@ fn create_ui<'local>(
         env,
         activity,
         "古典吉他 · 标准调弦",
-        14.0,
+        13.0,
         MUTED_TEXT,
         false,
         GRAVITY_CENTER,
@@ -1648,19 +1777,7 @@ fn create_ui<'local>(
         &subtitle,
         MATCH_PARENT,
         WRAP_CONTENT,
-        [0, 0, 0, dp(14.0)],
-    )?;
-
-    let action = new_toggle(env, activity, "开始调音", 16.0, MIDNIGHT, dp(52.0))?;
-    set_background_tint(env, &action, BRASS)?;
-    set_content_description(env, &action, "开始调音。当前未录音")?;
-    add_with_height(
-        env,
-        &content,
-        &action,
-        MATCH_PARENT,
-        WRAP_CONTENT,
-        [0, 0, 0, dp(14.0)],
+        [0, 0, 0, dp(10.0)],
     )?;
 
     let card = new_linear_layout(env, activity, VERTICAL)?;
@@ -1690,7 +1807,7 @@ fn create_ui<'local>(
         env,
         activity,
         "待拨弦",
-        56.0,
+        64.0,
         WARM_WHITE,
         true,
         GRAVITY_CENTER,
@@ -1701,8 +1818,8 @@ fn create_ui<'local>(
         "setAutoSizeTextTypeUniformWithConfiguration",
         "(IIII)V",
         &[
-            JValue::Int(28),
-            JValue::Int(56),
+            JValue::Int(30),
+            JValue::Int(64),
             JValue::Int(2),
             JValue::Int(TEXT_UNIT_SP),
         ],
@@ -1772,34 +1889,73 @@ fn create_ui<'local>(
         [0, 0, 0, dp(4.0)],
     )?;
 
-    let progress = env.new_object(
-        "android/widget/SeekBar",
+    // Render the scale as a real read-only instrument rather than a disabled
+    // SeekBar. The tick marks remain visible while the needle disappears in idle.
+    let gauge = env.new_object(
+        "android/widget/FrameLayout",
         "(Landroid/content/Context;)V",
         &[JValue::Object(activity)],
     )?;
-    env.call_method(&progress, "setMax", "(I)V", &[JValue::Int(100)])?;
-    env.call_method(&progress, "setProgress", "(I)V", &[JValue::Int(50)])?;
-    env.call_method(&progress, "setEnabled", "(Z)V", &[JValue::Bool(0)])?;
-    env.call_method(&progress, "setSplitTrack", "(Z)V", &[JValue::Bool(0)])?;
+    let ticks = new_linear_layout(env, activity, HORIZONTAL)?;
     env.call_method(
-        &progress,
-        "setPadding",
-        "(IIII)V",
+        &ticks,
+        "setImportantForAccessibility",
+        "(I)V",
+        &[JValue::Int(2)],
+    )?;
+    for index in 0..=20 {
+        let major = index % 5 == 0;
+        let tick = new_text_view(
+            env,
+            activity,
+            if major { "┃" } else { "│" },
+            if major { 19.0 } else { 13.0 },
+            if index == 10 { BRASS_SOFT } else { MUTED_TEXT },
+            false,
+            GRAVITY_CENTER,
+        )?;
+        let params = linear_params(env, 0, MATCH_PARENT, Some(1.0), [0; 4])?;
+        add_view(env, &ticks, &tick, params)?;
+    }
+    let ticks_params = env.new_object(
+        "android/widget/FrameLayout$LayoutParams",
+        "(III)V",
         &[
-            JValue::Int(dp(10.0)),
-            JValue::Int(0),
-            JValue::Int(dp(10.0)),
-            JValue::Int(0),
+            JValue::Int(MATCH_PARENT),
+            JValue::Int(MATCH_PARENT),
+            JValue::Int(GRAVITY_CENTER),
         ],
     )?;
-    set_progress_tint(env, &progress, PANEL_STROKE)?;
-    set_thumb_tint(env, &progress, MUTED_TEXT)?;
+    add_view(env, &gauge, &ticks, ticks_params)?;
+    let needle = env.new_object(
+        "android/view/View",
+        "(Landroid/content/Context;)V",
+        &[JValue::Object(activity)],
+    )?;
+    set_rounded_background(env, &needle, BRASS_SOFT, BRASS_SOFT, dp(2.0) as f32, 0)?;
+    env.call_method(&needle, "setVisibility", "(I)V", &[JValue::Int(4)])?;
+    env.call_method(
+        &needle,
+        "setImportantForAccessibility",
+        "(I)V",
+        &[JValue::Int(2)],
+    )?;
+    let needle_params = env.new_object(
+        "android/widget/FrameLayout$LayoutParams",
+        "(III)V",
+        &[
+            JValue::Int(dp(3.0)),
+            JValue::Int(dp(38.0)),
+            JValue::Int(GRAVITY_CENTER),
+        ],
+    )?;
+    add_view(env, &gauge, &needle, needle_params)?;
     add_with_height(
         env,
         &card,
-        &progress,
+        &gauge,
         MATCH_PARENT,
-        dp(28.0),
+        dp(44.0),
         [0, 0, 0, dp(2.0)],
     )?;
     let scale = new_linear_layout(env, activity, HORIZONTAL)?;
@@ -1842,6 +1998,17 @@ fn create_ui<'local>(
         WRAP_CONTENT,
         [0, 0, 0, dp(4.0)],
     )?;
+    let signal_row = new_linear_layout(env, activity, HORIZONTAL)?;
+    add_with_height(env, &card, &signal_row, MATCH_PARENT, WRAP_CONTENT, [0; 4])?;
+    let microphone = new_text_view(
+        env,
+        activity,
+        "○ 麦克风待机",
+        12.0,
+        MUTED_TEXT,
+        true,
+        GRAVITY_CENTER,
+    )?;
     let level = new_text_view(
         env,
         activity,
@@ -1851,13 +2018,16 @@ fn create_ui<'local>(
         false,
         GRAVITY_CENTER,
     )?;
-    add_with_height(env, &card, &level, MATCH_PARENT, WRAP_CONTENT, [0; 4])?;
+    let signal_params = linear_params(env, 0, WRAP_CONTENT, Some(1.0), [0; 4])?;
+    add_view(env, &signal_row, &microphone, signal_params)?;
+    let level_params = linear_params(env, 0, WRAP_CONTENT, Some(1.0), [0; 4])?;
+    add_view(env, &signal_row, &level, level_params)?;
 
     let select_title = new_text_view(
         env,
         activity,
-        "选择弦",
-        18.0,
+        "选择琴弦",
+        17.0,
         WARM_WHITE,
         true,
         GRAVITY_CENTER,
@@ -1873,7 +2043,7 @@ fn create_ui<'local>(
     let select_hint = new_text_view(
         env,
         activity,
-        "点选锁定 · 再点恢复自动",
+        "手动锁定目标琴弦，或使用自动识别",
         12.0,
         MUTED_TEXT,
         false,
@@ -1887,6 +2057,11 @@ fn create_ui<'local>(
         WRAP_CONTENT,
         [0, 0, 0, dp(8.0)],
     )?;
+
+    let auto = new_toggle(env, activity, "自动识别", 15.0, WARM_WHITE, dp(48.0))?;
+    set_rounded_background(env, &auto, CHIP_IDLE, CHIP_IDLE, dp(13.0) as f32, 0)?;
+    set_content_description(env, &auto, "自动识别琴弦，不锁定特定琴弦")?;
+    add_with_height(env, &content, &auto, MATCH_PARENT, WRAP_CONTENT, [0, 0, 0, dp(8.0)])?;
 
     let row_one = new_linear_layout(env, activity, HORIZONTAL)?;
     let row_two = new_linear_layout(env, activity, HORIZONTAL)?;
@@ -1954,26 +2129,44 @@ fn create_ui<'local>(
     )?;
     add_with_height(env, &content, &footer, MATCH_PARENT, WRAP_CONTENT, [0; 4])?;
 
+    // Keep the primary action reachable with one hand even when the content
+    // scrolls on a smaller device or at a larger system font scale.
+    let action = new_toggle(env, activity, "开始调音", 16.0, MIDNIGHT, dp(56.0))?;
+    set_rounded_background(env, &action, BRASS, BRASS, dp(16.0) as f32, 0)?;
+    set_content_description(env, &action, "开始调音。当前未录音")?;
+    add_with_height(
+        env,
+        &shell,
+        &action,
+        MATCH_PARENT,
+        WRAP_CONTENT,
+        [dp(16.0), dp(8.0), dp(16.0), dp(12.0)],
+    )?;
+
     env.call_method(
         activity,
         "setContentView",
         "(Landroid/view/View;)V",
-        &[JValue::Object(&scroll)],
+        &[JValue::Object(&shell)],
     )?;
 
     let chips: [GlobalRef; 6] = chip_refs
         .try_into()
         .map_err(|_| jni::errors::Error::NullPtr("chip array"))?;
     Ok(OverlayViews {
-        root: env.new_global_ref(&scroll)?,
+        root: env.new_global_ref(&shell)?,
+        scroll: env.new_global_ref(&scroll)?,
         action: env.new_global_ref(&action)?,
+        auto: env.new_global_ref(&auto)?,
         note: env.new_global_ref(&note)?,
         caption: env.new_global_ref(&caption)?,
         frequency: env.new_global_ref(&frequency)?,
         cents: env.new_global_ref(&cents)?,
         status: env.new_global_ref(&status)?,
         level: env.new_global_ref(&level)?,
-        progress: env.new_global_ref(&progress)?,
+        microphone: env.new_global_ref(&microphone)?,
+        gauge: env.new_global_ref(&gauge)?,
+        needle: env.new_global_ref(&needle)?,
         chips,
         touch_slop_px: scaled_touch_slop(env, activity).unwrap_or(dp(8.0) as f32),
     })
@@ -2182,42 +2375,6 @@ fn set_background_tint(env: &mut JNIEnv, view: &JObject, color: i32) -> JniResul
     env.call_method(
         view,
         "setBackgroundTintList",
-        "(Landroid/content/res/ColorStateList;)V",
-        &[JValue::Object(&tint)],
-    )?;
-    Ok(())
-}
-
-fn set_progress_tint(env: &mut JNIEnv, view: &JObject, color: i32) -> JniResult<()> {
-    let tint = env
-        .call_static_method(
-            "android/content/res/ColorStateList",
-            "valueOf",
-            "(I)Landroid/content/res/ColorStateList;",
-            &[JValue::Int(color)],
-        )?
-        .l()?;
-    env.call_method(
-        view,
-        "setProgressTintList",
-        "(Landroid/content/res/ColorStateList;)V",
-        &[JValue::Object(&tint)],
-    )?;
-    Ok(())
-}
-
-fn set_thumb_tint(env: &mut JNIEnv, view: &JObject, color: i32) -> JniResult<()> {
-    let tint = env
-        .call_static_method(
-            "android/content/res/ColorStateList",
-            "valueOf",
-            "(I)Landroid/content/res/ColorStateList;",
-            &[JValue::Int(color)],
-        )?
-        .l()?;
-    env.call_method(
-        view,
-        "setThumbTintList",
         "(Landroid/content/res/ColorStateList;)V",
         &[JValue::Object(&tint)],
     )?;
