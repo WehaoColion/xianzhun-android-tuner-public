@@ -3,6 +3,7 @@ use crate::capture::{
     DigitalSilenceWatchdog, FrameWatchdog,
 };
 use crate::input::InputFrame;
+use crate::dial;
 use crate::pitch::{PitchAnalyzer, PitchReading};
 use crate::selection::select_target;
 use crate::tuning::STRINGS;
@@ -175,6 +176,8 @@ struct OverlayViews {
     microphone: GlobalRef,
     gauge: GlobalRef,
     needle: GlobalRef,
+    pivot: GlobalRef,
+    gauge_labels: [GlobalRef; 5],
     chips: [GlobalRef; 6],
     touch_slop_px: f32,
 }
@@ -970,6 +973,8 @@ impl AppState {
                 )?;
             }
             if reading_changed {
+                env.call_method(self.views.gauge_labels[2].as_obj(), "setTextColor", "(I)V",
+                    &[JValue::Int(if snapshot.in_tune { TUNED_GREEN } else { MUTED_TEXT })])?;
                 env.call_method(self.views.needle.as_obj(), "setAlpha", "(F)V",
                     &[JValue::Float(if snapshot.phase == UiPhase::Fading { 0.38 } else { 1.0 })])?;
                 let accent = if snapshot.in_tune {
@@ -1007,6 +1012,7 @@ impl AppState {
                 )?;
             }
             if old.is_none_or(|old| old.selected_target.is_none() != snapshot.selected_target.is_none()) {
+                set_toggle_text(env, self.views.auto.as_obj(), if snapshot.selected_target.is_none() { "自动识别 · 已选" } else { "自动识别" })?;
                 env.call_method(
                     self.views.auto.as_obj(),
                     "setChecked",
@@ -1137,7 +1143,7 @@ fn sync_needle(
     if width <= 0 || needle_height <= 0 {
         return Ok(());
     }
-    let angle = (cents.clamp(-50.0, 50.0) / 50.0) * 75.0;
+    let angle = dial::angle(cents);
     // Tracking already smooths accepted measurements. Apply the exact angle
     // of the same snapshot used by the text rather than restarting animations.
     env.call_method(needle, "setRotation", "(F)V", &[JValue::Float(angle)])?;
@@ -1286,6 +1292,7 @@ fn read_audio_record(
     let started_at = Instant::now();
     let mut watchdog = FrameWatchdog::new(Duration::ZERO);
     let mut silence_watchdog = DigitalSilenceWatchdog::new();
+    let mut observed_waveform = false;
     let sdk = android_sdk_version(env);
     let mut mute_checked_at = None;
     let mut system_silenced = false;
@@ -1349,16 +1356,17 @@ fn read_audio_record(
             filled += read_len;
             if filled == FRAME_SIZE {
                 let frame = InputFrame::from_pcm(&samples).expect("complete PCM frame");
+                if !frame.digital_silence && !system_silenced { observed_waveform = true; }
                 let signal = silence_watchdog.observe_frame(
                     now,
                     &samples,
                     system_silenced,
-                    configuration.can_retry_digital_silence(),
+                    configuration.can_retry_digital_silence() && !observed_waveform,
                 );
                 if signal == CaptureSignalStatus::ZeroSignalTimeout {
                     startup_log(
                         5,
-                        "audio delivered constant PCM for 2 seconds; trying fallback",
+                        "audio startup delivered only constant PCM; trying fallback",
                     );
                     return Ok(CaptureAttempt::NoWaveform);
                 }
@@ -1746,6 +1754,10 @@ fn create_ui<'local>(
         "(Ljava/lang/CharSequence;)V",
         &[JValue::Object(&root_description_obj)],
     )?;
+    let hero = new_linear_layout(env, activity, VERTICAL)?;
+    env.call_method(&hero, "setGravity", "(I)V", &[JValue::Int(GRAVITY_CENTER_HORIZONTAL)])?;
+    add_with_height(env, &shell, &hero, MATCH_PARENT, WRAP_CONTENT,
+        [dp(12.0), dp(4.0), dp(12.0), dp(3.0)])?;
     let scroll_params = linear_params(env, MATCH_PARENT, 0, Some(1.0), [0; 4])?;
     add_view(env, &shell, &scroll, scroll_params)?;
 
@@ -1761,78 +1773,36 @@ fn create_ui<'local>(
         "setPadding",
         "(IIII)V",
         &[
-            JValue::Int(dp(16.0)),
             JValue::Int(dp(12.0)),
-            JValue::Int(dp(16.0)),
-            JValue::Int(dp(20.0)),
+            JValue::Int(dp(3.0)),
+            JValue::Int(dp(12.0)),
+            JValue::Int(dp(8.0)),
         ],
     )?;
     let content_params = linear_params(env, MATCH_PARENT, WRAP_CONTENT, None, [0; 4])?;
     add_view(env, &scroll, &content, content_params)?;
 
-    let title = new_text_view(
-        env,
-        activity,
-        "✦  弦准  ✦",
-        25.0,
-        BRASS_SOFT,
-        true,
-        GRAVITY_CENTER,
-    )?;
+    let header = new_linear_layout(env, activity, HORIZONTAL)?;
+    env.call_method(&header, "setGravity", "(I)V", &[JValue::Int(GRAVITY_CENTER)])?;
+    add_with_height(env, &hero, &header, MATCH_PARENT, WRAP_CONTENT, [0, 0, 0, dp(3.0)])?;
+    let title = new_text_view(env, activity, "弦准", 19.0, BRASS_SOFT, true, GRAVITY_CENTER)?;
     set_serif_font(env, &title, true)?;
-    add_with_height(
-        env,
-        &content,
-        &title,
-        MATCH_PARENT,
-        WRAP_CONTENT,
-        [0, 0, 0, dp(3.0)],
-    )?;
-    let subtitle = new_text_view(
-        env,
-        activity,
-        "古典吉他 · 标准调弦",
-        13.0,
-        MUTED_TEXT,
-        false,
-        GRAVITY_CENTER,
-    )?;
-    add_with_height(
-        env,
-        &content,
-        &subtitle,
-        MATCH_PARENT,
-        WRAP_CONTENT,
-        [0, 0, 0, dp(10.0)],
-    )?;
-
-
-    // Mic state is placed above the dial. Signal delivery and actual pitch
-    // recognition are distinct; silence must not be presented as a tuned note.
+    let title_params = linear_params(env, 0, WRAP_CONTENT, Some(0.5), [0; 4])?;
+    add_view(env, &header, &title, title_params)?;
     let microphone = new_text_view(
-        env, activity, "○ 麦克风待机", 12.0, BRASS_SOFT, false, GRAVITY_CENTER,
+        env, activity, "○ 麦克风待机", 12.0, MUTED_TEXT, false, GRAVITY_CENTER,
     )?;
-    set_gradient_background(
-        env, &microphone, &[CHIP_IDLE, PANEL], PANEL_STROKE, dp(18.0) as f32, dp(1.0),
-    )?;
-    env.call_method(
-        &microphone,
-        "setPadding",
-        "(IIII)V",
-        &[
-            JValue::Int(dp(12.0)), JValue::Int(dp(8.0)),
-            JValue::Int(dp(12.0)), JValue::Int(dp(8.0)),
-        ],
-    )?;
-    add_with_height(env, &content, &microphone, WRAP_CONTENT, WRAP_CONTENT, [0, 0, 0, dp(12.0)])?;
+    env.call_method(&microphone, "setSingleLine", "(Z)V", &[JValue::Bool(1)])?;
+    let mic_params = linear_params(env, 0, WRAP_CONTENT, Some(1.0), [0; 4])?;
+    add_view(env, &header, &microphone, mic_params)?;
 
     let card = new_linear_layout(env, activity, VERTICAL)?;
     env.call_method(&card, "setGravity", "(I)V", &[JValue::Int(GRAVITY_CENTER)])?;
     env.call_method(
         &card, "setPadding", "(IIII)V",
         &[
-            JValue::Int(dp(11.0)), JValue::Int(dp(14.0)),
-            JValue::Int(dp(11.0)), JValue::Int(dp(12.0)),
+            JValue::Int(dp(8.0)), JValue::Int(dp(4.0)),
+            JValue::Int(dp(8.0)), JValue::Int(dp(4.0)),
         ],
     )?;
     set_gradient_background(
@@ -1840,31 +1810,29 @@ fn create_ui<'local>(
         PANEL_STROKE, dp(23.0) as f32, dp(1.0),
     )?;
     env.call_method(&card, "setElevation", "(F)V", &[JValue::Float(dp(4.0) as f32)])?;
-    add_with_height(env, &content, &card, MATCH_PARENT, WRAP_CONTENT, [0, 0, 0, dp(14.0)])?;
+    add_with_height(env, &hero, &card, MATCH_PARENT, WRAP_CONTENT, [0; 4])?;
 
-    let note = new_text_view(env, activity, "待拨弦", 68.0, WARM_WHITE, true, GRAVITY_CENTER)?;
+    let note = new_text_view(env, activity, "待拨弦", 48.0, WARM_WHITE, true, GRAVITY_CENTER)?;
     set_serif_font(env, &note, true)?;
     env.call_method(&note, "setSingleLine", "(Z)V", &[JValue::Bool(1)])?;
     env.call_method(
         &note,
         "setAutoSizeTextTypeUniformWithConfiguration",
         "(IIII)V",
-        &[JValue::Int(28), JValue::Int(68), JValue::Int(2), JValue::Int(TEXT_UNIT_SP)],
+        &[JValue::Int(24), JValue::Int(48), JValue::Int(2), JValue::Int(TEXT_UNIT_SP)],
     )?;
-    add_with_height(env, &card, &note, MATCH_PARENT, WRAP_CONTENT, [0, 0, 0, dp(1.0)])?;
+    add_with_height(env, &card, &note, MATCH_PARENT, dp(52.0), [0; 4])?;
 
     let caption = new_text_view(
         env, activity, "自动识别", 15.0, BRASS_SOFT, false, GRAVITY_CENTER,
     )?;
-    add_with_height(env, &card, &caption, MATCH_PARENT, WRAP_CONTENT, [0, 0, 0, dp(9.0)])?;
+    add_with_height(env, &card, &caption, MATCH_PARENT, WRAP_CONTENT, [0, 0, 0, dp(2.0)])?;
 
-    // Screen width sets a predictable dial aspect ratio and pivot geometry.
-    // The SVG-like vector is drawn by Android's own VectorDrawable engine.
-    let usable_width = display_width_px(env, activity).unwrap_or(dp(360.0)) - dp(70.0);
-    let dial_width = usable_width.max(dp(170.0)).min(dp(360.0));
-    let dial_height = ((dial_width as f32) * (200.0 / 360.0)).round() as i32;
-    let needle_height = ((dial_width as f32) * (119.0 / 360.0)).round() as i32;
-    let needle_bottom = ((dial_width as f32) * (19.0 / 360.0)).round() as i32;
+    let dial_width = responsive_dial_width(env, activity, density);
+    let scale = dial_width as f32 / dial::WIDTH;
+    let dial_height = (dial::HEIGHT * scale).round() as i32;
+    let needle_height = (dial::NEEDLE_RADIUS * scale).round() as i32;
+    let needle_bottom = ((dial::HEIGHT - dial::PIVOT_Y) * scale).round() as i32;
 
     let gauge = env.new_object(
         "android/widget/FrameLayout",
@@ -1963,40 +1931,34 @@ fn create_ui<'local>(
     add_view(env, &gauge, &pivot, pivot_params)?;
     add_with_height(env, &card, &gauge, dial_width, dial_height, [0, 0, 0, dp(2.0)])?;
 
-    let scale = new_linear_layout(env, activity, HORIZONTAL)?;
-    for label in ["−50", "−25", "0", "+25", "+50"] {
-        let marker = new_text_view(
-            env, activity, label, 11.0,
-            if label == "0" { TUNED_GREEN } else { MUTED_TEXT },
-            false, GRAVITY_CENTER,
-        )?;
-        let params = linear_params(env, 0, WRAP_CONTENT, Some(1.0), [0; 4])?;
-        add_view(env, &scale, &marker, params)?;
+    let mut label_refs = Vec::with_capacity(5);
+    for (cents, label) in dial::LABEL_CENTS.into_iter().zip(["−50", "−25", "0", "+25", "+50"]) {
+        let marker = new_text_view(env, activity, label, (dial_width as f32 / density / 29.0).clamp(7.0, 11.0), MUTED_TEXT, false, GRAVITY_CENTER)?;
+        env.call_method(&marker, "setSingleLine", "(Z)V", &[JValue::Bool(1)])?;
+        env.call_method(&marker, "setImportantForAccessibility", "(I)V", &[JValue::Int(2)])?;
+        let params = dial_label_params(env, cents, dial_width)?;
+        add_view(env, &gauge, &marker, params)?;
+        label_refs.push(env.new_global_ref(&marker)?);
     }
-    add_with_height(env, &card, &scale, dial_width, WRAP_CONTENT, [0, 0, 0, dp(3.0)])?;
-    let flat_sharp = new_linear_layout(env, activity, HORIZONTAL)?;
-    for label in ["偏低    ♭", "♯    偏高"] {
-        let view = new_text_view(env, activity, label, 12.0, MUTED_TEXT, false, GRAVITY_CENTER)?;
-        let params = linear_params(env, 0, WRAP_CONTENT, Some(1.0), [0; 4])?;
-        add_view(env, &flat_sharp, &view, params)?;
-    }
-    add_with_height(env, &card, &flat_sharp, dial_width, WRAP_CONTENT, [0, 0, 0, dp(12.0)])?;
+    let gauge_labels: [GlobalRef; 5] = label_refs.try_into()
+        .map_err(|_| jni::errors::Error::NullPtr("dial label array"))?;
 
     let cents = new_text_view(
-        env, activity, "— 音分", 24.0, BRASS_SOFT, true, GRAVITY_CENTER,
+        env, activity, "— 音分", 22.0, BRASS_SOFT, true, GRAVITY_CENTER,
     )?;
     env.call_method(&cents, "setSingleLine", "(Z)V", &[JValue::Bool(1)])?;
     env.call_method(
         &cents, "setAutoSizeTextTypeUniformWithConfiguration", "(IIII)V",
-        &[JValue::Int(14), JValue::Int(24), JValue::Int(1), JValue::Int(TEXT_UNIT_SP)],
+        &[JValue::Int(12), JValue::Int(22), JValue::Int(1), JValue::Int(TEXT_UNIT_SP)],
     )?;
-    add_with_height(env, &card, &cents, MATCH_PARENT, WRAP_CONTENT, [0, 0, 0, dp(3.0)])?;
+    add_with_height(env, &card, &cents, MATCH_PARENT, dp(32.0), [0; 4])?;
 
     let status = new_text_view(
         env, activity, "点开始，再拨一根空弦", 15.0, WARM_WHITE, false, GRAVITY_CENTER,
     )?;
     env.call_method(&status, "setMinLines", "(I)V", &[JValue::Int(2)])?;
-    add_with_height(env, &card, &status, MATCH_PARENT, WRAP_CONTENT, [0, 0, 0, dp(7.0)])?;
+    env.call_method(&status, "setMaxLines", "(I)V", &[JValue::Int(2)])?;
+    add_with_height(env, &card, &status, MATCH_PARENT, WRAP_CONTENT, [0; 4])?;
 
     let frequency = new_text_view(
         env, activity, "检测 — Hz  ·  目标 — Hz", 13.0, MUTED_TEXT, false, GRAVITY_CENTER,
@@ -2012,18 +1974,18 @@ fn create_ui<'local>(
             JValue::Int(dp(8.0)), JValue::Int(dp(9.0)),
         ],
     )?;
-    add_with_height(env, &card, &frequency, MATCH_PARENT, WRAP_CONTENT, [0, 0, 0, dp(10.0)])?;
+    add_with_height(env, &content, &frequency, MATCH_PARENT, WRAP_CONTENT, [0, 0, 0, dp(3.0)])?;
 
     let level = new_text_view(
         env, activity, "等待声音", 12.0, MUTED_TEXT, false, GRAVITY_CENTER,
     )?;
-    add_with_height(env, &card, &level, MATCH_PARENT, WRAP_CONTENT, [0; 4])?;
+    add_with_height(env, &content, &level, MATCH_PARENT, WRAP_CONTENT, [0, 0, 0, dp(5.0)])?;
 
     let select_title = new_text_view(
         env,
         activity,
-        "◇  选择琴弦  ◇",
-        17.0,
+        "目标琴弦",
+        15.0,
         WARM_WHITE,
         true,
         GRAVITY_CENTER,
@@ -2037,24 +1999,6 @@ fn create_ui<'local>(
         WRAP_CONTENT,
         [0, 0, 0, dp(2.0)],
     )?;
-    let select_hint = new_text_view(
-        env,
-        activity,
-        "手动锁定目标琴弦，或使用自动识别",
-        12.0,
-        MUTED_TEXT,
-        false,
-        GRAVITY_CENTER,
-    )?;
-    add_with_height(
-        env,
-        &content,
-        &select_hint,
-        MATCH_PARENT,
-        WRAP_CONTENT,
-        [0, 0, 0, dp(8.0)],
-    )?;
-
     let auto = new_toggle(env, activity, "自动识别", 15.0, WARM_WHITE, dp(48.0))?;
     set_tactile_background(
         env, &auto, &[CHIP_ACTIVE, PANEL], BRASS_SOFT, dp(16.0) as f32, dp(1.0),
@@ -2084,7 +2028,7 @@ fn create_ui<'local>(
     let mut chip_refs = Vec::with_capacity(6);
     for (index, target) in STRINGS.iter().enumerate() {
         let label = format!("{}\n{}弦", target.note, STRINGS.len() - index);
-        let chip = new_toggle(env, activity, &label, 16.0, WARM_WHITE, dp(62.0))?;
+        let chip = new_toggle(env, activity, &label, 15.0, WARM_WHITE, dp(48.0))?;
         env.call_method(&chip, "setMinWidth", "(I)V", &[JValue::Int(0)])?;
         env.call_method(&chip, "setMinimumWidth", "(I)V", &[JValue::Int(0)])?;
         env.call_method(
@@ -2093,9 +2037,9 @@ fn create_ui<'local>(
             "(IIII)V",
             &[
                 JValue::Int(dp(4.0)),
-                JValue::Int(dp(8.0)),
+                JValue::Int(dp(3.0)),
                 JValue::Int(dp(4.0)),
-                JValue::Int(dp(8.0)),
+                JValue::Int(dp(3.0)),
             ],
         )?;
         let description = env.new_string(format!(
@@ -2118,7 +2062,7 @@ fn create_ui<'local>(
         chip_refs.push(env.new_global_ref(&chip)?);
     }
 
-    let footer_text = format!("古典吉他 · 标准调弦   |   v{} · 本机处理", env!("CARGO_PKG_VERSION"));
+    let footer_text = format!("标准调弦 · v{}", env!("CARGO_PKG_VERSION"));
     let footer = new_text_view(
         env,
         activity,
@@ -2132,7 +2076,7 @@ fn create_ui<'local>(
 
     // Keep the primary action reachable with one hand even when the content
     // scrolls on a smaller device or at a larger system font scale.
-    let action = new_toggle(env, activity, "开始调音", 19.0, MIDNIGHT, dp(58.0))?;
+    let action = new_toggle(env, activity, "开始调音", 18.0, MIDNIGHT, dp(52.0))?;
     set_serif_font(env, &action, true)?;
     set_tactile_background(
         env, &action, &[BRASS_SOFT, BRASS], BRASS_SOFT, dp(20.0) as f32, dp(2.0),
@@ -2147,7 +2091,7 @@ fn create_ui<'local>(
         &action,
         MATCH_PARENT,
         WRAP_CONTENT,
-        [dp(16.0), dp(8.0), dp(16.0), dp(12.0)],
+        [dp(12.0), dp(3.0), dp(12.0), dp(6.0)],
     )?;
 
     env.call_method(
@@ -2174,6 +2118,8 @@ fn create_ui<'local>(
         microphone: env.new_global_ref(&microphone)?,
         gauge: env.new_global_ref(&gauge)?,
         needle: env.new_global_ref(&needle)?,
+        pivot: env.new_global_ref(&pivot)?,
+        gauge_labels,
         chips,
         touch_slop_px: scaled_touch_slop(env, activity).unwrap_or(dp(8.0) as f32),
     })
@@ -2493,14 +2439,71 @@ fn set_tactile_background(
     Ok(())
 }
 
-fn display_width_px(env: &mut JNIEnv, activity: &JObject) -> Option<i32> {
-    let result = (|| -> JniResult<i32> {
+fn responsive_dial_width(env: &mut JNIEnv, activity: &JObject, density: f32) -> i32 {
+    let metrics = (|| -> JniResult<(i32, i32)> {
         let resources = env.call_method(activity, "getResources", "()Landroid/content/res/Resources;", &[])?.l()?;
         let metrics = env.call_method(&resources, "getDisplayMetrics", "()Landroid/util/DisplayMetrics;", &[])?.l()?;
-        env.get_field(&metrics, "widthPixels", "I")?.i()
+        Ok((env.get_field(&metrics, "widthPixels", "I")?.i()?,
+            env.get_field(&metrics, "heightPixels", "I")?.i()?))
     })();
     clear_exception(env);
-    result.ok().filter(|width| *width > 0)
+    let (width, height) = metrics.unwrap_or(((360.0*density) as i32, (700.0*density) as i32));
+    let side = (40.0*density).round() as i32;
+    (width - side).min((height as f32 * 0.46).round() as i32)
+        .min((320.0*density) as i32).max(1)
+}
+
+fn dial_label_params<'local>(env: &mut JNIEnv<'local>, cents: f32, width: i32) -> JniResult<JObject<'local>> {
+    let scale = width as f32 / dial::WIDTH;
+    let label_width = (48.0 * scale).round() as i32;
+    let label_height = (28.0 * scale).round() as i32;
+    let (x, y) = dial::label_center(cents);
+    let params = env.new_object("android/widget/FrameLayout$LayoutParams", "(III)V",
+        &[JValue::Int(label_width), JValue::Int(label_height), JValue::Int(51)])?;
+    env.call_method(&params, "setMargins", "(IIII)V", &[
+        JValue::Int((x * scale).round() as i32 - label_width / 2),
+        JValue::Int((y * scale).round() as i32 - label_height / 2),
+        JValue::Int(0), JValue::Int(0),
+    ])?;
+    Ok(params)
+}
+
+fn resize_dial(env: &mut JNIEnv, app: &AppState) -> JniResult<()> {
+    let density = display_density(env, app.activity.as_obj()).max(1.0);
+    let width = responsive_dial_width(env, app.activity.as_obj(), density);
+    let scale = width as f32 / dial::WIDTH;
+    let h = (dial::HEIGHT * scale).round() as i32;
+    let needle_h = (dial::NEEDLE_RADIUS * scale).round() as i32;
+    let bottom = ((dial::HEIGHT - dial::PIVOT_Y) * scale).round() as i32;
+    let diameter = (13.0*density).round() as i32;
+    let needle_w = (3.0*density).round() as i32;
+    let params = env.call_method(app.views.gauge.as_obj(), "getLayoutParams",
+        "()Landroid/view/ViewGroup$LayoutParams;", &[])?.l()?;
+    env.set_field(&params, "width", "I", JValue::Int(width))?;
+    env.set_field(&params, "height", "I", JValue::Int(h))?;
+    env.call_method(app.views.gauge.as_obj(), "setLayoutParams",
+        "(Landroid/view/ViewGroup$LayoutParams;)V", &[JValue::Object(&params)])?;
+    for (view, w, h, margin) in [
+        (&app.views.needle, needle_w, needle_h, bottom),
+        (&app.views.pivot, diameter, diameter, (bottom - diameter/2).max(0)),
+    ] {
+        let params = env.new_object("android/widget/FrameLayout$LayoutParams", "(III)V",
+            &[JValue::Int(w), JValue::Int(h), JValue::Int(81)])?;
+        env.call_method(&params, "setMargins", "(IIII)V",
+            &[JValue::Int(0), JValue::Int(0), JValue::Int(0), JValue::Int(margin)])?;
+        env.call_method(view.as_obj(), "setLayoutParams", "(Landroid/view/ViewGroup$LayoutParams;)V",
+            &[JValue::Object(&params)])?;
+    }
+    env.call_method(app.views.needle.as_obj(), "setPivotX", "(F)V", &[JValue::Float(needle_w as f32/2.0)])?;
+    env.call_method(app.views.needle.as_obj(), "setPivotY", "(F)V", &[JValue::Float(needle_h as f32)])?;
+    for (view, cents) in app.views.gauge_labels.iter().zip(dial::LABEL_CENTS) {
+        let params = dial_label_params(env, cents, width)?;
+        env.call_method(view.as_obj(), "setLayoutParams", "(Landroid/view/ViewGroup$LayoutParams;)V",
+            &[JValue::Object(&params)])?;
+        env.call_method(view.as_obj(), "setTextSize", "(IF)V",
+            &[JValue::Int(TEXT_UNIT_SP), JValue::Float((width as f32 / density / 29.0).clamp(7.0, 11.0))])?;
+    }
+    Ok(())
 }
 
 fn set_serif_font(env: &mut JNIEnv, view: &JObject, bold: bool) -> JniResult<()> {
@@ -2867,6 +2870,7 @@ unsafe extern "C" fn on_input_queue_destroyed(
 unsafe extern "C" fn on_configuration_changed(activity: *mut ANativeActivity) {
     if let Some(app) = app_from_activity(activity) {
         if let Ok(mut env) = app.vm.attach_current_thread() {
+            if resize_dial(&mut env, &app).is_err() { clear_exception(&mut env); }
             app.sync_views(&mut env, true);
         }
     }
