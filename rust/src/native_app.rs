@@ -4,16 +4,17 @@ use crate::capture::{
 };
 use crate::input::InputFrame;
 use crate::pitch::{PitchAnalyzer, PitchReading};
-use crate::selection::{select_target, SelectionContext, SelectionEffect};
+use crate::selection::select_target;
 use crate::tuning::STRINGS;
 use crate::ui_state::{
     permission_request_should_settle, progress_accessibility_description, AccessibilityState,
-    InputStatus, UiSnapshot, UiState,
+    InputStatus, UiPhase, UiSnapshot, UiState,
 };
 use jni::errors::Result as JniResult;
 use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
 use jni::sys::{jboolean, jobject};
 use jni::{JNIEnv, JavaVM};
+use std::collections::VecDeque;
 use std::ffi::{c_char, c_int, c_long, c_void, CString};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -24,10 +25,11 @@ use std::time::{Duration, Instant};
 const RECORD_AUDIO: &str = "android.permission.RECORD_AUDIO";
 const PERMISSION_REQUEST_CODE: i32 = 3110;
 const FRAME_SIZE: usize = 4096;
-const UI_POLL_MILLIS: c_long = 90;
+const ANALYSIS_HOP: usize = 2048;
+const UI_POLL_MILLIS: c_long = 16;
 const WINDOW_FORMAT_RGBA_8888: i32 = 1;
 const AUDIO_READ_NON_BLOCKING: i32 = 1;
-const AUDIO_IDLE_POLL: Duration = Duration::from_millis(20);
+const AUDIO_IDLE_POLL: Duration = Duration::from_millis(8);
 const MATCH_PARENT: i32 = -1;
 const WRAP_CONTENT: i32 = -2;
 const VERTICAL: i32 = 1;
@@ -60,6 +62,7 @@ const FLAT_SHARP: i32 = color(0xed, 0xa0, 0x84);
 const CHIP_IDLE: i32 = color(0x35, 0x24, 0x1e);
 const CHIP_ACTIVE: i32 = color(0x85, 0x4c, 0x2b);
 const CHIP_TUNED: i32 = color(0x2d, 0x4c, 0x31);
+const CHIP_DETECTED: i32 = color(0x5d, 0x43, 0x2d);
 
 const fn color(red: u8, green: u8, blue: u8) -> i32 {
     ((0xff_u32 << 24) | ((red as u32) << 16) | ((green as u32) << 8) | blue as u32) as i32
@@ -201,8 +204,7 @@ struct AppState {
     audio: Mutex<Option<AudioHandle>>,
     input: Mutex<Option<InputHandle>>,
     input_queue: Mutex<Option<usize>>,
-    pending_touch: Mutex<Option<(f32, f32)>>,
-    pending_scroll_y: Mutex<f32>,
+    pending_inputs: Mutex<VecDeque<PendingInput>>,
     accessibility: Mutex<AccessibilityState>,
 }
 
@@ -223,6 +225,11 @@ struct InputHandle {
 struct MainLoopContext {
     app: Weak<AppState>,
     choreographer: *mut AChoreographer,
+}
+
+enum PendingInput {
+    Tap { down_x: f32, down_y: f32, x: f32, y: f32 },
+    Scroll { down_x: f32, down_y: f32, delta: f32 },
 }
 
 #[derive(Default)]
@@ -255,8 +262,7 @@ impl AppState {
             audio: Mutex::new(None),
             input: Mutex::new(None),
             input_queue: Mutex::new(None),
-            pending_touch: Mutex::new(None),
-            pending_scroll_y: Mutex::new(0.0),
+            pending_inputs: Mutex::new(VecDeque::new()),
             accessibility: Mutex::new(AccessibilityState::default()),
         })
     }
@@ -326,8 +332,7 @@ impl AppState {
         self.resumed.store(false, Ordering::SeqCst);
         self.stop_audio();
         self.stop_input();
-        *self.pending_touch.lock().unwrap() = None;
-        *self.pending_scroll_y.lock().unwrap() = 0.0;
+        self.pending_inputs.lock().unwrap().clear();
         if !self.permission_request_in_flight.load(Ordering::SeqCst) {
             self.listening_requested.store(false, Ordering::SeqCst);
             self.ui.lock().unwrap().show_paused();
@@ -404,8 +409,8 @@ impl AppState {
         app.reap_finished_audio();
         Self::settle_permission_request_if_ready(app, env);
         Self::poll_controls(app, env);
-        Self::process_pending_scroll(app, env);
-        Self::process_pending_touch(app, env);
+        Self::process_pending_inputs(app, env);
+        app.ui.lock().unwrap().expire_reading(Instant::now());
 
         if app.listening_requested.load(Ordering::SeqCst)
             && app.audio_retry_allowed.load(Ordering::SeqCst)
@@ -418,136 +423,97 @@ impl AppState {
         app.sync_views(env, false);
     }
 
+    // Only keyboard/accessibility activations take the framework toggle route
+    // when the native input queue is present. Both routes dispatch the same
+    // commands, never infer recording changes from an old pitch snapshot.
     fn poll_controls(app: &Arc<Self>, env: &mut JNIEnv) {
-        let action_checked = env
-            .call_method(app.views.action.as_obj(), "isChecked", "()Z", &[])
-            .and_then(|value| value.z())
-            .unwrap_or(false);
-        clear_exception(env);
-        let requested = app.listening_requested.load(Ordering::SeqCst);
-        let last_synced = app.last_synced_action_checked.load(Ordering::SeqCst);
-        if !app.permission_request_in_flight.load(Ordering::SeqCst)
-            && action_checked != requested
-            && requested == last_synced
-        {
-            Self::handle_action(app, env);
-        }
-
-        let current = app.ui.lock().unwrap().selected_target;
-        let mut checked = [false; 6];
-        for (index, chip) in app.views.chips.iter().enumerate() {
-            checked[index] = env
-                .call_method(chip.as_obj(), "isChecked", "()Z", &[])
-                .and_then(|value| value.z())
-                .unwrap_or(false);
+        let Some((last_action, last_selected)) = app.last_synced.lock().unwrap()
+            .as_ref().map(|s| (s.action_checked, s.snapshot.selected_target)) else { return; };
+        let read_checked = |env: &mut JNIEnv, view: &JObject| -> Option<bool> {
+            let value = env.call_method(view, "isChecked", "()Z", &[]).and_then(|value| value.z()).ok();
             clear_exception(env);
-        }
-
-        let auto_checked = env
-            .call_method(app.views.auto.as_obj(), "isChecked", "()Z", &[])
-            .and_then(|value| value.z())
-            .unwrap_or(false);
-        clear_exception(env);
-        let newly_checked = checked
-            .iter()
-            .enumerate()
-            .find(|(index, value)| **value && Some(*index) != current)
-            .map(|(index, _)| index);
-        // A freshly chosen string wins over an old auto toggle state.
-        // The explicit auto choice clears the lock without stopping capture.
-        let desired = if newly_checked.is_some() {
-            newly_checked
-        } else if auto_checked {
-            None
-        } else {
-            current.filter(|index| checked[*index])
+            value
         };
-        if desired != current {
-            Self::handle_target_selection(app, env, desired);
-        } else if current.is_none() && !auto_checked {
-            // Auto mode acts like a radio choice, not a toggle that can leave
-            // every option looking unselected while auto is still active.
-            let _ = env.call_method(
-                app.views.auto.as_obj(),
-                "setChecked",
-                "(Z)V",
-                &[JValue::Bool(1)],
-            );
-            clear_exception(env);
+        if let Some(action) = read_checked(env, app.views.action.as_obj()) {
+            if !app.permission_request_in_flight.load(Ordering::SeqCst)
+                && action != last_action
+                && app.listening_requested.load(Ordering::SeqCst) == last_action
+            {
+                Self::handle_action(app, env);
+            }
         }
+        let current = app.ui.lock().unwrap().selected_target;
+        if current == last_selected {
+            let mut selected = None;
+            for (index, chip) in app.views.chips.iter().enumerate() {
+                if Some(index) != current && read_checked(env, chip.as_obj()) == Some(true) {
+                    selected = Some(index);
+                }
+            }
+            if let Some(index) = selected {
+                Self::handle_target_selection(app, Some(index));
+            } else if current.is_some() && read_checked(env, app.views.auto.as_obj()) == Some(true) {
+                Self::handle_target_selection(app, None);
+            }
+            // Tapping the already selected option is idempotent. Restore its
+            // checked appearance, rather than interpreting uncheck as unlock.
+        }
+        app.sync_views(env, false);
+        app.reconcile_checked_controls(env);
     }
 
-    fn process_pending_touch(app: &Arc<Self>, env: &mut JNIEnv) {
-        let Some((x, y)) = app.pending_touch.lock().unwrap().take() else {
-            return;
-        };
-        if !view_contains_point(env, app.views.root.as_obj(), x, y) {
-            return;
-        }
-        if view_contains_point(env, app.views.action.as_obj(), x, y) {
-            Self::handle_action(app, env);
-            return;
-        }
-        if view_contains_point(env, app.views.auto.as_obj(), x, y) {
-            Self::handle_target_selection(app, env, None);
-            return;
-        }
-        for (index, chip) in app.views.chips.iter().enumerate() {
-            if view_contains_point(env, chip.as_obj(), x, y) {
-                let current = app.ui.lock().unwrap().selected_target;
-                let desired = if current == Some(index) {
-                    None
-                } else {
-                    Some(index)
-                };
-                Self::handle_target_selection(app, env, desired);
-                return;
+    fn reconcile_checked_controls(&self, env: &mut JNIEnv) {
+        let selected = self.ui.lock().unwrap().selected_target;
+        for (view, expected) in std::iter::once((&self.views.auto, selected.is_none()))
+            .chain(self.views.chips.iter().enumerate().map(|(i, view)| (view, selected == Some(i))))
+        {
+            if env.call_method(view.as_obj(), "isChecked", "()Z", &[])
+                .and_then(|value| value.z()).ok() != Some(expected) {
+                clear_exception(env);
+                let _ = env.call_method(view.as_obj(), "setChecked", "(Z)V",
+                    &[JValue::Bool(jboolean::from(expected))]);
+                clear_exception(env);
             }
         }
     }
 
-    fn handle_target_selection(app: &Arc<Self>, env: &mut JNIEnv, selected: Option<usize>) {
-        let effect = {
-            let mut ui = app.ui.lock().unwrap();
-            select_target(
-                &mut ui,
-                selected,
-                SelectionContext {
-                    resumed: app.resumed.load(Ordering::SeqCst),
-                    listening_requested: app.listening_requested.load(Ordering::SeqCst),
-                    permission_in_flight: app.permission_request_in_flight.load(Ordering::SeqCst),
-                },
-            )
-        };
-        startup_log(
-            4,
-            &format!("target selection={selected:?} effect={effect:?}"),
-        );
-        if effect == SelectionEffect::StartListening {
-            // Do not hold the UI mutex across JNI or the permission/start path.
-            // This effect is emitted only while not already listening: calling
-            // the toggle action for every selection would stop active capture.
-            Self::handle_action(app, env);
+    fn process_pending_inputs(app: &Arc<Self>, env: &mut JNIEnv) {
+        let events = std::mem::take(&mut *app.pending_inputs.lock().unwrap());
+        for event in events {
+            if !app.resumed.load(Ordering::SeqCst) { break; }
+            match event {
+                PendingInput::Tap { down_x, down_y, x, y } => {
+                    let hit = |env: &mut JNIEnv, view: &JObject| {
+                        view_contains_point(env, view, down_x, down_y)
+                            && view_contains_point(env, view, x, y)
+                    };
+                    if hit(env, app.views.action.as_obj()) {
+                        Self::handle_action(app, env);
+                    } else if hit(env, app.views.auto.as_obj()) {
+                        Self::handle_target_selection(app, None);
+                    } else {
+                        for (index, chip) in app.views.chips.iter().enumerate() {
+                            if hit(env, chip.as_obj()) {
+                                Self::handle_target_selection(app, Some(index));
+                                break;
+                            }
+                        }
+                    }
+                    app.sync_views(env, false);
+                }
+                PendingInput::Scroll { down_x, down_y, delta } => {
+                    if view_contains_point(env, app.views.scroll.as_obj(), down_x, down_y) {
+                        let _ = env.call_method(app.views.scroll.as_obj(), "scrollBy", "(II)V",
+                            &[JValue::Int(0), JValue::Int(delta.round() as i32)]);
+                        clear_exception(env);
+                    }
+                }
+            }
         }
     }
 
-    fn process_pending_scroll(app: &Arc<Self>, env: &mut JNIEnv) {
-        let delta = {
-            let mut pending = app.pending_scroll_y.lock().unwrap();
-            let delta = *pending;
-            *pending = 0.0;
-            delta
-        };
-        if delta.abs() < 0.5 {
-            return;
-        }
-        let _ = env.call_method(
-            app.views.scroll.as_obj(),
-            "scrollBy",
-            "(II)V",
-            &[JValue::Int(0), JValue::Int(delta.round() as i32)],
-        );
-        clear_exception(env);
+    fn handle_target_selection(app: &Arc<Self>, selected: Option<usize>) {
+        select_target(&mut app.ui.lock().unwrap(), selected);
     }
 
     fn handle_action(app: &Arc<Self>, env: &mut JNIEnv) {
@@ -829,11 +795,12 @@ impl AppState {
         frame: InputFrame,
         reading: Option<PitchReading>,
         system_silenced: bool,
+        target_epoch: u64,
     ) {
         let mut ui = self.ui.lock().unwrap();
         // Stop/pause sets its flag before taking this same lock.  Late worker
         // frames cannot restore a reading after the UI has been reset.
-        if capture_active(self, control) {
+        if capture_active(self, control) && ui.target_epoch == target_epoch {
             ui.apply_input_frame(frame, reading, system_silenced);
         }
     }
@@ -881,6 +848,7 @@ impl AppState {
         let button_changed = old.is_none_or(|old| old.button != snapshot.button);
         let reading_changed = old.is_none_or(|old| {
             old.in_tune != snapshot.in_tune
+                || old.phase != snapshot.phase
                 || old.needle_cents.is_some() != snapshot.needle_cents.is_some()
                 || old.needle_cents.is_some_and(|c| c.abs() > 4.0)
                     != snapshot.needle_cents.is_some_and(|c| c.abs() > 4.0)
@@ -1002,6 +970,8 @@ impl AppState {
                 )?;
             }
             if reading_changed {
+                env.call_method(self.views.needle.as_obj(), "setAlpha", "(F)V",
+                    &[JValue::Float(if snapshot.phase == UiPhase::Fading { 0.38 } else { 1.0 })])?;
                 let accent = if snapshot.in_tune {
                     TUNED_GREEN
                 } else if snapshot.needle_cents.is_some_and(|v| v.abs() > 4.0) {
@@ -1075,10 +1045,12 @@ impl AppState {
                             &[CHIP_TUNED, PANEL]
                         } else if tint == CHIP_ACTIVE {
                             &[BRASS, CHIP_ACTIVE]
+                        } else if tint == CHIP_DETECTED {
+                            &[CHIP_DETECTED, PANEL]
                         } else {
                             &[CHIP_IDLE, PANEL]
                         },
-                        if tint == CHIP_TUNED { TUNED_GREEN } else if tint == CHIP_ACTIVE {
+                        if tint == CHIP_TUNED { TUNED_GREEN } else if tint == CHIP_ACTIVE || tint == CHIP_DETECTED {
                             BRASS_SOFT
                         } else {
                             PANEL_STROKE
@@ -1132,6 +1104,7 @@ fn microphone_indicator(status: InputStatus) -> (&'static str, i32) {
         InputStatus::Starting => ("◌ 正在连接", BRASS_SOFT),
         InputStatus::Receiving => ("● 已收到声音", BRASS_SOFT),
         InputStatus::DigitalSilence => ("○ 已连接 · 无波形", MUTED_TEXT),
+        InputStatus::Stalled => ("○ 输入暂未更新", MUTED_TEXT),
         InputStatus::SystemSilenced => ("! 系统静音", BRASS_SOFT),
     }
 }
@@ -1143,7 +1116,7 @@ fn sync_needle(
     gauge: &JObject,
     needle: &JObject,
     cents: Option<f32>,
-    animate: bool,
+    _animate: bool,
 ) -> JniResult<()> {
     let Some(cents) = cents else {
         let animator = env.call_method(
@@ -1165,30 +1138,10 @@ fn sync_needle(
         return Ok(());
     }
     let angle = (cents.clamp(-50.0, 50.0) / 50.0) * 75.0;
+    // Tracking already smooths accepted measurements. Apply the exact angle
+    // of the same snapshot used by the text rather than restarting animations.
+    env.call_method(needle, "setRotation", "(F)V", &[JValue::Float(angle)])?;
     env.call_method(needle, "setVisibility", "(I)V", &[JValue::Int(0)])?;
-    if animate {
-        let animator = env.call_method(
-            needle,
-            "animate",
-            "()Landroid/view/ViewPropertyAnimator;",
-            &[],
-        )?.l()?;
-        env.call_method(
-            &animator,
-            "rotation",
-            "(F)Landroid/view/ViewPropertyAnimator;",
-            &[JValue::Float(angle)],
-        )?;
-        env.call_method(
-            &animator,
-            "setDuration",
-            "(J)Landroid/view/ViewPropertyAnimator;",
-            &[JValue::Long(130)],
-        )?;
-        env.call_method(&animator, "start", "()V", &[])?;
-    } else {
-        env.call_method(needle, "setRotation", "(F)V", &[JValue::Float(angle)])?;
-    }
     Ok(())
 }
 
@@ -1196,8 +1149,10 @@ fn chip_tint(snapshot: &UiSnapshot, index: usize) -> i32 {
     let active = snapshot.active_target == Some(index);
     if active && snapshot.in_tune {
         CHIP_TUNED
-    } else if active || snapshot.selected_target == Some(index) {
+    } else if snapshot.selected_target == Some(index) {
         CHIP_ACTIVE
+    } else if active && snapshot.needle_cents.is_some() && snapshot.phase == UiPhase::Reading {
+        CHIP_DETECTED
     } else {
         CHIP_IDLE
     }
@@ -1326,6 +1281,7 @@ fn read_audio_record(
     let buffer = env.new_short_array(FRAME_SIZE as i32)?;
     let mut samples = vec![0_i16; FRAME_SIZE];
     let mut filled = 0;
+    let mut target_epoch = app.ui.lock().unwrap().target_epoch;
     let mut analyzer = PitchAnalyzer::default();
     let started_at = Instant::now();
     let mut watchdog = FrameWatchdog::new(Duration::ZERO);
@@ -1339,6 +1295,12 @@ fn read_audio_record(
 
     while capture_active(app, control) {
         let now = started_at.elapsed();
+        let current_epoch = app.ui.lock().unwrap().target_epoch;
+        if current_epoch != target_epoch {
+            // No buffered PCM from the former selection enters the new target.
+            filled = 0;
+            target_epoch = current_epoch;
+        }
         if mute_checked_at.is_none_or(|last| now.saturating_sub(last) >= Duration::from_millis(500))
         {
             mute_observation = capture_is_system_silenced(env, app, record, sdk);
@@ -1347,6 +1309,10 @@ fn read_audio_record(
                 system_silenced = muted;
             }
             mute_checked_at = Some(now);
+            if was_silenced != system_silenced {
+                filled = 0;
+                silence_watchdog = DigitalSilenceWatchdog::new();
+            }
             if system_silenced {
                 app.show_capture_status(control, true);
             } else if was_silenced {
@@ -1401,7 +1367,7 @@ fn read_audio_record(
                 } else {
                     analyzer.analyze_pcm(&samples, sample_rate as f32)
                 };
-                app.apply_input_frame(control, frame, reading, system_silenced);
+                app.apply_input_frame(control, frame, reading, system_silenced, target_epoch);
                 frames = frames.saturating_add(1);
                 if frames == 1 || now.saturating_sub(diagnostic_at) >= Duration::from_secs(5) {
                     // Aggregate metadata only; PCM is never written or logged.
@@ -1411,7 +1377,8 @@ fn read_audio_record(
                     ));
                     diagnostic_at = now;
                 }
-                filled = 0;
+                samples.copy_within(ANALYSIS_HOP..FRAME_SIZE, 0);
+                filled = FRAME_SIZE - ANALYSIS_HOP;
                 // Complete frames and waveform delivery are distinct. Only
                 // digitally constant PCM triggers signal fallback; a quiet
                 // varying waveform or missing pitch never changes sources.
@@ -1440,7 +1407,7 @@ fn input_loop(app: Arc<AppState>, running: Arc<AtomicBool>, queue_addr: usize) {
             && app.running.load(Ordering::SeqCst)
             && app.resumed.load(Ordering::SeqCst)
         {
-            let ident = ALooper_pollOnce(100, ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
+            let ident = ALooper_pollOnce(16, ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
             if ident == INPUT_QUEUE_IDENT {
                 drain_input_queue(&app, queue, &mut gesture);
             }
@@ -1498,7 +1465,9 @@ unsafe fn drain_input_queue(
                     };
                     gesture.last_y = y;
                     if gesture.moved {
-                        *app.pending_scroll_y.lock().unwrap() += delta;
+                        app.pending_inputs.lock().unwrap().push_back(PendingInput::Scroll {
+                            down_x: gesture.down_x, down_y: gesture.down_y, delta,
+                        });
                     }
                 }
                 AMOTION_EVENT_ACTION_UP if gesture.active => {
@@ -1508,9 +1477,13 @@ unsafe fn drain_input_queue(
                         && total_x <= app.views.touch_slop_px
                         && total_y <= app.views.touch_slop_px
                     {
-                        *app.pending_touch.lock().unwrap() = Some((x, y));
+                        app.pending_inputs.lock().unwrap().push_back(PendingInput::Tap {
+                            down_x: gesture.down_x, down_y: gesture.down_y, x, y,
+                        });
                     } else {
-                        *app.pending_scroll_y.lock().unwrap() += gesture.last_y - y;
+                        app.pending_inputs.lock().unwrap().push_back(PendingInput::Scroll {
+                            down_x: gesture.down_x, down_y: gesture.down_y, delta: gesture.last_y - y,
+                        });
                     }
                     gesture.active = false;
                 }
@@ -2703,10 +2676,10 @@ fn prepare_view_window(env: &mut JNIEnv, activity: &JObject) -> JniResult<()> {
     let window = env
         .call_method(activity, "getWindow", "()Landroid/view/Window;", &[])?
         .l()?;
-    // NativeActivity takes the window surface and input queue before calling
-    // this Rust entry point.  Our UI uses framework Views: return both to the
-    // framework before its first ViewRoot is attached, or it will never draw
-    // those Views and will bypass their normal touch dispatch.
+    // Return the surface for framework View rendering, but keep NativeActivity's
+    // input queue for ordered Rust touch commands. Handled motion events are
+    // not delivered again to ToggleButton; keyboard/accessibility still work
+    // through the framework fallback.
     env.call_method(
         &window,
         "takeSurface",
@@ -2717,11 +2690,11 @@ fn prepare_view_window(env: &mut JNIEnv, activity: &JObject) -> JniResult<()> {
         &window,
         "takeInputQueue",
         "(Landroid/view/InputQueue$Callback;)V",
-        &[JValue::Object(&JObject::null())],
+        &[JValue::Object(activity)],
     )?;
     startup_log(
         4,
-        "startup window uses framework drawing and touch dispatch",
+        "startup window uses framework drawing and ordered native touch dispatch",
     );
     Ok(())
 }
