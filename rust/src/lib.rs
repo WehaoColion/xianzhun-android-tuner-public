@@ -4,6 +4,8 @@ mod capture;
 mod input;
 mod pitch;
 #[cfg(any(target_os = "android", test))]
+mod dial;
+#[cfg(any(target_os = "android", test))]
 mod selection;
 mod tuning;
 #[cfg(any(target_os = "android", test))]
