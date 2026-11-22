@@ -4,12 +4,17 @@ use crate::tuning::{cents_between, classify_reading, STRINGS};
 use std::time::{Duration, Instant};
 
 const READING_HOLD: Duration = Duration::from_millis(900);
+const LIVE_READING_TIMEOUT: Duration = Duration::from_millis(180);
+const NEEDLE_HOLD: Duration = Duration::from_millis(380);
+const PCM_TIMEOUT: Duration = Duration::from_millis(350);
 const ACCESSIBILITY_ANNOUNCEMENT_INTERVAL: Duration = Duration::from_millis(1_500);
 pub(crate) const PERMISSION_RESULT_SETTLE_DELAY: Duration = Duration::from_millis(1_500);
 const MIN_TUNING_CONFIDENCE: f32 = 0.72;
 const TUNED_CENTS_TOLERANCE: f32 = 4.0;
-const TUNED_CONFIRMATION_FRAMES: u8 = 3;
-const SMOOTHING_RESET_CENTS: f32 = 6.0;
+pub(crate) const TUNED_CONFIRMATION_FRAMES: u8 = 5;
+const TUNED_ENTRY_CENTS: f32 = 3.0;
+const TARGET_CONFIRMATION_FRAMES: u8 = 3;
+const OUTLIER_CENTS: f32 = 20.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum InputStatus {
@@ -17,6 +22,7 @@ pub(crate) enum InputStatus {
     Starting,
     Receiving,
     DigitalSilence,
+    Stalled,
     SystemSilenced,
 }
 
@@ -60,6 +66,10 @@ pub(crate) struct UiState {
     pub(crate) smoothed_frequency_hz: Option<f32>,
     pub(crate) last_target: Option<usize>,
     pub(crate) last_reading_at: Option<Instant>,
+    pub(crate) last_pcm_at: Option<Instant>,
+    pub(crate) target_epoch: u64,
+    pending_target: Option<(usize, u8)>,
+    pending_jump: Option<f32>,
     pub(crate) tuned_candidate_target: Option<usize>,
     pub(crate) tuned_candidate_frames: u8,
     pub(crate) note: String,
@@ -94,6 +104,10 @@ impl UiState {
             smoothed_frequency_hz: None,
             last_target: None,
             last_reading_at: None,
+            last_pcm_at: None,
+            target_epoch: 0,
+            pending_target: None,
+            pending_jump: None,
             tuned_candidate_target: None,
             tuned_candidate_frames: 0,
             note: "待拨弦".to_string(),
@@ -199,49 +213,128 @@ impl UiState {
         self.changed();
     }
 
+    // A bad measurement is not a new measurement. Keep a visibly historical
+    // needle briefly, revoke live tune immediately and expire even if PCM stalls.
+    fn lose_reading(&mut self, now: Instant) {
+        self.pending_jump = None;
+        self.pending_target = None;
+        self.tuned_candidate_target = None;
+        self.tuned_candidate_frames = 0;
+        self.mark_historical(now);
+    }
+
+    fn mark_historical(&mut self, now: Instant) {
+        self.in_tune = false;
+        self.tuned_candidate_target = None;
+        self.tuned_candidate_frames = 0;
+        let age = self.last_reading_at.map(|last| now.saturating_duration_since(last));
+        match age {
+            Some(age) if age < READING_HOLD => {
+                let was_fading = self.phase == UiPhase::Fading;
+                let hide = age >= NEEDLE_HOLD && self.needle_cents.is_some();
+                self.phase = UiPhase::Fading;
+                if hide { self.needle_cents = None; }
+                if !was_fading {
+                    self.status = "信号变弱，请再拨一次".to_string();
+                    self.cents = "上次读数 · 非实时".to_string();
+                    self.frequency = self.frequency.replace("检测 ", "上次 ");
+                }
+                if !was_fading || hide { self.changed(); }
+            }
+            _ if self.phase != UiPhase::AwaitingSound => {
+                let input = self.input_status;
+                let level = self.level.clone();
+                let pcm = self.last_pcm_at;
+                self.show_idle_without_status();
+                self.input_status = input;
+                self.level = level;
+                self.last_pcm_at = pcm;
+                self.phase = UiPhase::AwaitingSound;
+                self.status = self.listening_prompt();
+                self.changed();
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn expire_reading(&mut self, now: Instant) {
+        if !self.accepts_input() || self.input_status == InputStatus::SystemSilenced { return; }
+        if self.last_pcm_at.is_some_and(|last| now.saturating_duration_since(last) >= PCM_TIMEOUT)
+            && self.input_status != InputStatus::Stalled {
+            self.input_status = InputStatus::Stalled;
+            self.level = "暂未收到新音频".to_string();
+            self.changed();
+        }
+        if self.last_reading_at.is_some_and(|last| now.saturating_duration_since(last) >= LIVE_READING_TIMEOUT) {
+            // Do not discard fresh candidate evidence merely because the last
+            // *accepted* reading is older. A stalled stream has no fresh PCM.
+            if self.input_status == InputStatus::Stalled {
+                self.pending_target = None;
+                self.pending_jump = None;
+            }
+            self.mark_historical(now);
+        }
+    }
+
     pub(crate) fn apply_reading(&mut self, reading: Option<PitchReading>) {
+        let now = Instant::now();
         let estimate = reading.and_then(|reading| {
             classify_reading(&reading, self.selected_target, self.last_target)
                 .map(|estimate| (reading, estimate))
         });
-
         let Some((reading, estimate)) = estimate else {
-            if self
-                .last_reading_at
-                .map(|last| last.elapsed() < READING_HOLD)
-                .unwrap_or(false)
-            {
-                if self.phase == UiPhase::Fading {
-                    return;
-                }
-                self.phase = UiPhase::Fading;
-                self.status = "再拨一次".to_string();
-                self.level = "声音较弱".to_string();
-                self.cents = "等待稳定".to_string();
-                self.needle_cents = None;
-                self.in_tune = false;
-                self.tuned_candidate_target = None;
-                self.tuned_candidate_frames = 0;
-            } else {
-                if self.phase == UiPhase::AwaitingSound {
-                    return;
-                }
-                self.phase = UiPhase::AwaitingSound;
-                self.status = self.listening_prompt();
-                self.show_idle_without_status();
-            }
-            self.changed();
+            self.lose_reading(now);
             return;
         };
 
+        // Do not switch the automatic target on one stray harmonic. A manual
+        // target is authoritative. On an actual switch, clear the old filter.
+        if self.selected_target.is_none() && self.last_target.is_some_and(|old| old != estimate.target_index) {
+            let count = match self.pending_target {
+                Some((target, count)) if target == estimate.target_index => count.saturating_add(1),
+                _ => 1,
+            };
+            self.pending_target = Some((estimate.target_index, count));
+            if count < TARGET_CONFIRMATION_FRAMES {
+                self.in_tune = false;
+                self.tuned_candidate_frames = 0;
+                self.tuned_candidate_target = None;
+                self.phase = UiPhase::Fading;
+                self.cents = "切换琴弦 · 确认中".to_string();
+                self.frequency = self.frequency.replace("检测 ", "上次 ");
+                self.status = "正在确认新琴弦".to_string();
+                self.changed();
+                return;
+            }
+            self.smoothed_frequency_hz = None;
+            self.pending_jump = None;
+        }
+        self.pending_target = None;
+
+        // Reject a single large excursion, but follow a sustained real turn
+        // of the tuning peg without keeping an obsolete tuned indication.
+        if self.last_target == Some(estimate.target_index) {
+            if let Some(old) = self.smoothed_frequency_hz {
+                if cents_between(estimate.frequency_hz, old).abs() > OUTLIER_CENTS
+                    && !self.pending_jump.is_some_and(|pending|
+                        cents_between(estimate.frequency_hz, pending).abs() <= OUTLIER_CENTS)
+                {
+                    self.lose_reading(now);
+                    self.pending_jump = Some(estimate.frequency_hz);
+                    return;
+                }
+            }
+        }
+        self.pending_jump = None;
         self.last_reading_at = Some(Instant::now());
         self.phase = UiPhase::Reading;
         let target = STRINGS[estimate.target_index];
         let smoothed = self.smooth_frequency(estimate.frequency_hz, estimate.target_index);
         let cents = cents_between(smoothed, target.frequency_hz);
         let raw_cents = cents_between(estimate.frequency_hz, target.frequency_hz);
-        let candidate_in_tune = cents.abs() <= TUNED_CENTS_TOLERANCE
-            && raw_cents.abs() <= TUNED_CENTS_TOLERANCE
+        let tolerance = if self.in_tune { TUNED_CENTS_TOLERANCE } else { TUNED_ENTRY_CENTS };
+        let candidate_in_tune = cents.abs() <= tolerance
+            && raw_cents.abs() <= tolerance
             && reading.confidence >= MIN_TUNING_CONFIDENCE;
         if candidate_in_tune {
             if self.tuned_candidate_target == Some(estimate.target_index) {
@@ -268,7 +361,6 @@ impl UiState {
         );
         self.cents = format_cents(cents, in_tune, reading.confidence);
         self.status = status_for(cents, in_tune, reading.confidence);
-        self.level = level_for(reading.level, reading.confidence);
         self.active_target = Some(estimate.target_index);
         self.last_target = Some(estimate.target_index);
         self.needle_cents = Some(cents);
@@ -319,6 +411,7 @@ impl UiState {
         if self.input_status == InputStatus::SystemSilenced {
             self.status = self.listening_prompt();
         }
+        self.last_pcm_at = Some(Instant::now());
         self.apply_reading(if frame.digital_silence { None } else { reading });
         let input_status = if frame.digital_silence {
             InputStatus::DigitalSilence
@@ -357,6 +450,8 @@ impl UiState {
             return;
         }
         self.selected_target = selected;
+        self.target_epoch = self.target_epoch.wrapping_add(1);
+        let previous_pcm = self.last_pcm_at;
         let previous_input_status = self.input_status;
         let previous_level = self.level.clone();
         self.show_idle_without_status();
@@ -368,6 +463,7 @@ impl UiState {
                 self.status = self.listening_prompt();
                 self.input_status = previous_input_status;
                 self.level = previous_level;
+                self.last_pcm_at = previous_pcm;
                 if previous_input_status == InputStatus::SystemSilenced {
                     self.status = "检查系统麦克风开关，或结束其他录音".to_string();
                 }
@@ -409,6 +505,9 @@ impl UiState {
         self.smoothed_frequency_hz = None;
         self.last_target = None;
         self.last_reading_at = None;
+        self.last_pcm_at = None;
+        self.pending_target = None;
+        self.pending_jump = None;
         self.tuned_candidate_target = None;
         self.tuned_candidate_frames = 0;
         self.note = target
@@ -421,18 +520,20 @@ impl UiState {
             .map(|target| format!("检测 — Hz  ·  目标 {:.2} Hz", target.frequency_hz))
             .unwrap_or_else(|| "检测 — Hz  ·  目标 — Hz".to_string());
         self.cents = "— 音分".to_string();
-        self.level = "等待声音".to_string();
+        self.level = if matches!(self.phase, UiPhase::Stopped | UiPhase::Paused | UiPhase::Ready | UiPhase::Permission | UiPhase::MicrophoneError) {
+            "麦克风未录音".to_string()
+        } else { "等待声音".to_string() };
         self.needle_cents = None;
         self.in_tune = false;
     }
 
     fn smooth_frequency(&mut self, frequency_hz: f32, target_index: usize) -> f32 {
         let next = match (self.smoothed_frequency_hz, self.last_target) {
-            (Some(previous), Some(previous_target))
-                if previous_target == target_index
-                    && cents_between(frequency_hz, previous).abs() <= SMOOTHING_RESET_CENTS =>
-            {
-                (previous * 0.45) + (frequency_hz * 0.55)
+            (Some(previous), Some(previous_target)) if previous_target == target_index => {
+                let delta = cents_between(frequency_hz, previous);
+                // Continuous, adaptive gain in logarithmic (cents) space.
+                let gain = 0.28 + 0.62 * (delta.abs() / 22.0).clamp(0.0, 1.0);
+                previous * 2.0_f32.powf(delta * gain / 1200.0)
             }
             _ => frequency_hz,
         };
@@ -483,7 +584,9 @@ impl AccessibilityState {
 }
 
 pub(crate) fn progress_accessibility_description(snapshot: &UiSnapshot) -> String {
-    if snapshot.needle_cents.is_none() {
+    if snapshot.phase == UiPhase::Fading {
+        "上次读数，非实时音高".to_string()
+    } else if snapshot.needle_cents.is_none() {
         "音高指示，暂无稳定读数".to_string()
     } else {
         format!("音高指示，{}，{}", snapshot.note, snapshot.cents)
@@ -532,18 +635,6 @@ fn status_for(cents: f32, in_tune: bool, confidence: f32) -> String {
     }
 }
 
-fn level_for(level: f32, confidence: f32) -> String {
-    if confidence < MIN_TUNING_CONFIDENCE {
-        "音高仍在稳定".to_string()
-    } else if level < 0.02 {
-        "声音较弱".to_string()
-    } else if level > 0.55 {
-        "声音较强，请轻拨".to_string()
-    } else {
-        "信号清晰".to_string()
-    }
-}
-
 pub(crate) fn permission_request_should_settle(
     in_flight: bool,
     has_window_focus: bool,
@@ -569,9 +660,9 @@ mod tests {
     }
 
     #[test]
-    fn tuning_requires_three_consecutive_stable_frames() {
+    fn tuning_requires_consecutive_stable_frames() {
         let mut ui = UiState::new();
-        for frame in 1..=3 {
+        for frame in 1..=TUNED_CONFIRMATION_FRAMES {
             ui.apply_reading(Some(stable_reading(STRINGS[0].frequency_hz)));
             assert_eq!(ui.tuned_candidate_frames, frame);
             assert_eq!(ui.in_tune, frame >= TUNED_CONFIRMATION_FRAMES);
@@ -591,7 +682,7 @@ mod tests {
         ui.apply_reading(Some(invalid));
         assert!(!ui.in_tune);
         assert_eq!(ui.tuned_candidate_frames, 0);
-        assert!(ui.needle_cents.is_none());
+        assert!(ui.needle_cents.is_some()); // historical only
         assert!(ui.phase == UiPhase::Fading);
 
         ui.apply_reading(Some(stable_reading(STRINGS[0].frequency_hz)));
@@ -620,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn frequency_smoothing_resets_after_a_material_jump() {
+    fn frequency_smoothing_is_continuous_and_resets_on_target_change() {
         let mut ui = UiState::new();
         let target = STRINGS[0].frequency_hz;
         assert_eq!(ui.smooth_frequency(target, 0), target);
@@ -631,7 +722,8 @@ mod tests {
         assert!(smoothed > target && smoothed < near);
 
         let far = target * 2.0_f32.powf(20.0 / 1200.0);
-        assert_eq!(ui.smooth_frequency(far, 0), far);
+        let updated = ui.smooth_frequency(far, 0);
+        assert!(updated > smoothed && updated < far);
         assert_eq!(ui.smooth_frequency(target, 1), target);
     }
 
@@ -805,4 +897,56 @@ mod tests {
         assert_eq!(ui.input_status, InputStatus::Receiving);
         assert!(!ui.in_tune);
     }
+
+    #[test]
+    fn stalled_pcm_expires_live_tune_without_another_frame() {
+        let mut ui = UiState::new();
+        ui.show_listening();
+        let frame = InputFrame::from_pcm(&[-2000, 2000]).unwrap();
+        for _ in 0..TUNED_CONFIRMATION_FRAMES {
+            ui.apply_input_frame(frame, Some(stable_reading(82.41)), false);
+        }
+        assert!(ui.in_tune);
+        let last = ui.last_reading_at.unwrap();
+        ui.expire_reading(last + LIVE_READING_TIMEOUT);
+        assert!(!ui.in_tune);
+        assert!(ui.phase == UiPhase::Fading);
+        assert!(ui.needle_cents.is_some());
+        ui.expire_reading(last + NEEDLE_HOLD);
+        assert!(ui.needle_cents.is_none());
+        assert!(ui.input_status == InputStatus::Stalled);
+        ui.expire_reading(last + READING_HOLD);
+        assert!(ui.active_target.is_none());
+    }
+
+    #[test]
+    fn auto_switch_requires_multiple_consistent_frames() {
+        let mut ui = UiState::new();
+        ui.show_listening();
+        ui.apply_reading(Some(stable_reading(82.41)));
+        ui.apply_reading(Some(stable_reading(110.0)));
+        assert_eq!(ui.active_target, Some(0));
+        assert!(!ui.in_tune);
+        ui.apply_reading(Some(stable_reading(110.0)));
+        assert_eq!(ui.active_target, Some(0));
+        ui.apply_reading(Some(stable_reading(110.0)));
+        assert_eq!(ui.active_target, Some(1));
+        assert!(!ui.in_tune);
+    }
+
+    #[test]
+    fn one_large_outlier_cannot_move_live_needle_or_confirm_tune() {
+        let mut ui = UiState::new();
+        ui.show_listening();
+        for _ in 0..TUNED_CONFIRMATION_FRAMES {
+            ui.apply_reading(Some(stable_reading(82.41)));
+        }
+        let needle = ui.needle_cents;
+        ui.apply_reading(Some(stable_reading(84.5)));
+        assert_eq!(ui.needle_cents, needle);
+        assert!(!ui.in_tune);
+        ui.apply_reading(Some(stable_reading(84.5)));
+        assert!(ui.needle_cents.unwrap() > 20.0);
+    }
+
 }

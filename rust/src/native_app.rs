@@ -3,17 +3,19 @@ use crate::capture::{
     DigitalSilenceWatchdog, FrameWatchdog,
 };
 use crate::input::InputFrame;
+use crate::dial;
 use crate::pitch::{PitchAnalyzer, PitchReading};
-use crate::selection::{select_target, SelectionContext, SelectionEffect};
+use crate::selection::select_target;
 use crate::tuning::STRINGS;
 use crate::ui_state::{
     permission_request_should_settle, progress_accessibility_description, AccessibilityState,
-    InputStatus, UiSnapshot, UiState,
+    InputStatus, UiPhase, UiSnapshot, UiState,
 };
 use jni::errors::Result as JniResult;
 use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
 use jni::sys::{jboolean, jobject};
 use jni::{JNIEnv, JavaVM};
+use std::collections::VecDeque;
 use std::ffi::{c_char, c_int, c_long, c_void, CString};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -24,10 +26,11 @@ use std::time::{Duration, Instant};
 const RECORD_AUDIO: &str = "android.permission.RECORD_AUDIO";
 const PERMISSION_REQUEST_CODE: i32 = 3110;
 const FRAME_SIZE: usize = 4096;
-const UI_POLL_MILLIS: c_long = 90;
+const ANALYSIS_HOP: usize = 2048;
+const UI_POLL_MILLIS: c_long = 16;
 const WINDOW_FORMAT_RGBA_8888: i32 = 1;
 const AUDIO_READ_NON_BLOCKING: i32 = 1;
-const AUDIO_IDLE_POLL: Duration = Duration::from_millis(20);
+const AUDIO_IDLE_POLL: Duration = Duration::from_millis(8);
 const MATCH_PARENT: i32 = -1;
 const WRAP_CONTENT: i32 = -2;
 const VERTICAL: i32 = 1;
@@ -60,6 +63,7 @@ const FLAT_SHARP: i32 = color(0xed, 0xa0, 0x84);
 const CHIP_IDLE: i32 = color(0x35, 0x24, 0x1e);
 const CHIP_ACTIVE: i32 = color(0x85, 0x4c, 0x2b);
 const CHIP_TUNED: i32 = color(0x2d, 0x4c, 0x31);
+const CHIP_DETECTED: i32 = color(0x5d, 0x43, 0x2d);
 
 const fn color(red: u8, green: u8, blue: u8) -> i32 {
     ((0xff_u32 << 24) | ((red as u32) << 16) | ((green as u32) << 8) | blue as u32) as i32
@@ -161,6 +165,8 @@ extern "C" {
 struct OverlayViews {
     root: GlobalRef,
     scroll: GlobalRef,
+    body: GlobalRef,
+    hero: GlobalRef,
     action: GlobalRef,
     auto: GlobalRef,
     note: GlobalRef,
@@ -172,6 +178,8 @@ struct OverlayViews {
     microphone: GlobalRef,
     gauge: GlobalRef,
     needle: GlobalRef,
+    pivot: GlobalRef,
+    gauge_labels: [GlobalRef; 5],
     chips: [GlobalRef; 6],
     touch_slop_px: f32,
 }
@@ -188,7 +196,6 @@ struct AppState {
     views: OverlayViews,
     ui: Mutex<UiState>,
     last_synced: Mutex<Option<SyncedViews>>,
-    last_synced_action_checked: AtomicBool,
     running: AtomicBool,
     resumed: AtomicBool,
     main_loop_active: AtomicBool,
@@ -201,8 +208,7 @@ struct AppState {
     audio: Mutex<Option<AudioHandle>>,
     input: Mutex<Option<InputHandle>>,
     input_queue: Mutex<Option<usize>>,
-    pending_touch: Mutex<Option<(f32, f32)>>,
-    pending_scroll_y: Mutex<f32>,
+    pending_inputs: Mutex<VecDeque<PendingInput>>,
     accessibility: Mutex<AccessibilityState>,
 }
 
@@ -225,6 +231,13 @@ struct MainLoopContext {
     choreographer: *mut AChoreographer,
 }
 
+enum PendingInput {
+    Press { x: f32, y: f32 },
+    ClearPress,
+    Tap { down_x: f32, down_y: f32, x: f32, y: f32 },
+    Scroll { down_x: f32, down_y: f32, delta: f32 },
+}
+
 #[derive(Default)]
 struct TouchGesture {
     active: bool,
@@ -242,7 +255,6 @@ impl AppState {
             views,
             ui: Mutex::new(UiState::new()),
             last_synced: Mutex::new(None),
-            last_synced_action_checked: AtomicBool::new(false),
             running: AtomicBool::new(true),
             resumed: AtomicBool::new(false),
             main_loop_active: AtomicBool::new(false),
@@ -255,8 +267,7 @@ impl AppState {
             audio: Mutex::new(None),
             input: Mutex::new(None),
             input_queue: Mutex::new(None),
-            pending_touch: Mutex::new(None),
-            pending_scroll_y: Mutex::new(0.0),
+            pending_inputs: Mutex::new(VecDeque::new()),
             accessibility: Mutex::new(AccessibilityState::default()),
         })
     }
@@ -326,8 +337,8 @@ impl AppState {
         self.resumed.store(false, Ordering::SeqCst);
         self.stop_audio();
         self.stop_input();
-        *self.pending_touch.lock().unwrap() = None;
-        *self.pending_scroll_y.lock().unwrap() = 0.0;
+        self.pending_inputs.lock().unwrap().clear();
+        if let Ok(mut env) = self.vm.attach_current_thread() { self.update_pressed(&mut env, None); }
         if !self.permission_request_in_flight.load(Ordering::SeqCst) {
             self.listening_requested.store(false, Ordering::SeqCst);
             self.ui.lock().unwrap().show_paused();
@@ -404,8 +415,8 @@ impl AppState {
         app.reap_finished_audio();
         Self::settle_permission_request_if_ready(app, env);
         Self::poll_controls(app, env);
-        Self::process_pending_scroll(app, env);
-        Self::process_pending_touch(app, env);
+        Self::process_pending_inputs(app, env);
+        app.ui.lock().unwrap().expire_reading(Instant::now());
 
         if app.listening_requested.load(Ordering::SeqCst)
             && app.audio_retry_allowed.load(Ordering::SeqCst)
@@ -418,136 +429,111 @@ impl AppState {
         app.sync_views(env, false);
     }
 
+    // Only keyboard/accessibility activations take the framework toggle route
+    // when the native input queue is present. Both routes dispatch the same
+    // commands, never infer recording changes from an old pitch snapshot.
     fn poll_controls(app: &Arc<Self>, env: &mut JNIEnv) {
-        let action_checked = env
-            .call_method(app.views.action.as_obj(), "isChecked", "()Z", &[])
-            .and_then(|value| value.z())
-            .unwrap_or(false);
-        clear_exception(env);
-        let requested = app.listening_requested.load(Ordering::SeqCst);
-        let last_synced = app.last_synced_action_checked.load(Ordering::SeqCst);
-        if !app.permission_request_in_flight.load(Ordering::SeqCst)
-            && action_checked != requested
-            && requested == last_synced
-        {
-            Self::handle_action(app, env);
-        }
-
-        let current = app.ui.lock().unwrap().selected_target;
-        let mut checked = [false; 6];
-        for (index, chip) in app.views.chips.iter().enumerate() {
-            checked[index] = env
-                .call_method(chip.as_obj(), "isChecked", "()Z", &[])
-                .and_then(|value| value.z())
-                .unwrap_or(false);
+        let Some((last_action, last_selected)) = app.last_synced.lock().unwrap()
+            .as_ref().map(|s| (s.action_checked, s.snapshot.selected_target)) else { return; };
+        let read_checked = |env: &mut JNIEnv, view: &JObject| -> Option<bool> {
+            let value = env.call_method(view, "isChecked", "()Z", &[]).and_then(|value| value.z()).ok();
             clear_exception(env);
-        }
-
-        let auto_checked = env
-            .call_method(app.views.auto.as_obj(), "isChecked", "()Z", &[])
-            .and_then(|value| value.z())
-            .unwrap_or(false);
-        clear_exception(env);
-        let newly_checked = checked
-            .iter()
-            .enumerate()
-            .find(|(index, value)| **value && Some(*index) != current)
-            .map(|(index, _)| index);
-        // A freshly chosen string wins over an old auto toggle state.
-        // The explicit auto choice clears the lock without stopping capture.
-        let desired = if newly_checked.is_some() {
-            newly_checked
-        } else if auto_checked {
-            None
-        } else {
-            current.filter(|index| checked[*index])
+            value
         };
-        if desired != current {
-            Self::handle_target_selection(app, env, desired);
-        } else if current.is_none() && !auto_checked {
-            // Auto mode acts like a radio choice, not a toggle that can leave
-            // every option looking unselected while auto is still active.
-            let _ = env.call_method(
-                app.views.auto.as_obj(),
-                "setChecked",
-                "(Z)V",
-                &[JValue::Bool(1)],
-            );
-            clear_exception(env);
+        if let Some(action) = read_checked(env, app.views.action.as_obj()) {
+            if !app.permission_request_in_flight.load(Ordering::SeqCst)
+                && action != last_action
+                && app.listening_requested.load(Ordering::SeqCst) == last_action
+            {
+                Self::handle_action(app, env);
+            }
         }
+        let current = app.ui.lock().unwrap().selected_target;
+        if current == last_selected {
+            let mut selected = None;
+            for (index, chip) in app.views.chips.iter().enumerate() {
+                if Some(index) != current && read_checked(env, chip.as_obj()) == Some(true) {
+                    selected = Some(index);
+                }
+            }
+            if let Some(index) = selected {
+                Self::handle_target_selection(app, Some(index));
+            } else if current.is_some() && read_checked(env, app.views.auto.as_obj()) == Some(true) {
+                Self::handle_target_selection(app, None);
+            }
+            // Tapping the already selected option is idempotent. Restore its
+            // checked appearance, rather than interpreting uncheck as unlock.
+        }
+        app.sync_views(env, false);
+        app.reconcile_checked_controls(env);
     }
 
-    fn process_pending_touch(app: &Arc<Self>, env: &mut JNIEnv) {
-        let Some((x, y)) = app.pending_touch.lock().unwrap().take() else {
-            return;
-        };
-        if !view_contains_point(env, app.views.root.as_obj(), x, y) {
-            return;
-        }
-        if view_contains_point(env, app.views.action.as_obj(), x, y) {
-            Self::handle_action(app, env);
-            return;
-        }
-        if view_contains_point(env, app.views.auto.as_obj(), x, y) {
-            Self::handle_target_selection(app, env, None);
-            return;
-        }
-        for (index, chip) in app.views.chips.iter().enumerate() {
-            if view_contains_point(env, chip.as_obj(), x, y) {
-                let current = app.ui.lock().unwrap().selected_target;
-                let desired = if current == Some(index) {
-                    None
-                } else {
-                    Some(index)
-                };
-                Self::handle_target_selection(app, env, desired);
-                return;
+    fn reconcile_checked_controls(&self, env: &mut JNIEnv) {
+        let selected = self.ui.lock().unwrap().selected_target;
+        for (view, expected) in std::iter::once((&self.views.auto, selected.is_none()))
+            .chain(self.views.chips.iter().enumerate().map(|(i, view)| (view, selected == Some(i))))
+        {
+            if env.call_method(view.as_obj(), "isChecked", "()Z", &[])
+                .and_then(|value| value.z()).ok() != Some(expected) {
+                clear_exception(env);
+                let _ = env.call_method(view.as_obj(), "setChecked", "(Z)V",
+                    &[JValue::Bool(jboolean::from(expected))]);
+                clear_exception(env);
             }
         }
     }
 
-    fn handle_target_selection(app: &Arc<Self>, env: &mut JNIEnv, selected: Option<usize>) {
-        let effect = {
-            let mut ui = app.ui.lock().unwrap();
-            select_target(
-                &mut ui,
-                selected,
-                SelectionContext {
-                    resumed: app.resumed.load(Ordering::SeqCst),
-                    listening_requested: app.listening_requested.load(Ordering::SeqCst),
-                    permission_in_flight: app.permission_request_in_flight.load(Ordering::SeqCst),
-                },
-            )
-        };
-        startup_log(
-            4,
-            &format!("target selection={selected:?} effect={effect:?}"),
-        );
-        if effect == SelectionEffect::StartListening {
-            // Do not hold the UI mutex across JNI or the permission/start path.
-            // This effect is emitted only while not already listening: calling
-            // the toggle action for every selection would stop active capture.
-            Self::handle_action(app, env);
+    fn process_pending_inputs(app: &Arc<Self>, env: &mut JNIEnv) {
+        let events = std::mem::take(&mut *app.pending_inputs.lock().unwrap());
+        for event in events {
+            if !app.resumed.load(Ordering::SeqCst) { break; }
+            match event {
+                PendingInput::Press { x, y } => {
+                    app.update_pressed(env, Some((x, y)));
+                }
+                PendingInput::ClearPress => app.update_pressed(env, None),
+                PendingInput::Tap { down_x, down_y, x, y } => {
+                    app.update_pressed(env, None);
+                    let hit = |env: &mut JNIEnv, view: &JObject| {
+                        view_contains_point(env, view, down_x, down_y)
+                            && view_contains_point(env, view, x, y)
+                    };
+                    if hit(env, app.views.action.as_obj()) {
+                        Self::handle_action(app, env);
+                    } else if hit(env, app.views.auto.as_obj()) {
+                        Self::handle_target_selection(app, None);
+                    } else {
+                        for (index, chip) in app.views.chips.iter().enumerate() {
+                            if hit(env, chip.as_obj()) {
+                                Self::handle_target_selection(app, Some(index));
+                                break;
+                            }
+                        }
+                    }
+                    app.sync_views(env, false);
+                }
+                PendingInput::Scroll { down_x, down_y, delta } => {
+                    app.update_pressed(env, None);
+                    if view_contains_point(env, app.views.scroll.as_obj(), down_x, down_y) {
+                        let _ = env.call_method(app.views.scroll.as_obj(), "scrollBy", "(II)V",
+                            &[JValue::Int(0), JValue::Int(delta.round() as i32)]);
+                        clear_exception(env);
+                    }
+                }
+            }
         }
     }
 
-    fn process_pending_scroll(app: &Arc<Self>, env: &mut JNIEnv) {
-        let delta = {
-            let mut pending = app.pending_scroll_y.lock().unwrap();
-            let delta = *pending;
-            *pending = 0.0;
-            delta
-        };
-        if delta.abs() < 0.5 {
-            return;
+    fn update_pressed(&self, env: &mut JNIEnv, point: Option<(f32, f32)>) {
+        for view in std::iter::once(&self.views.action).chain(std::iter::once(&self.views.auto)).chain(self.views.chips.iter()) {
+            let pressed = point.is_some_and(|(x, y)| view_contains_point(env, view.as_obj(), x, y));
+            let _ = env.call_method(view.as_obj(), "setPressed", "(Z)V", &[JValue::Bool(jboolean::from(pressed))]);
+            clear_exception(env);
         }
-        let _ = env.call_method(
-            app.views.scroll.as_obj(),
-            "scrollBy",
-            "(II)V",
-            &[JValue::Int(0), JValue::Int(delta.round() as i32)],
-        );
-        clear_exception(env);
+    }
+
+    fn handle_target_selection(app: &Arc<Self>, selected: Option<usize>) {
+        select_target(&mut app.ui.lock().unwrap(), selected);
     }
 
     fn handle_action(app: &Arc<Self>, env: &mut JNIEnv) {
@@ -829,11 +815,12 @@ impl AppState {
         frame: InputFrame,
         reading: Option<PitchReading>,
         system_silenced: bool,
+        target_epoch: u64,
     ) {
         let mut ui = self.ui.lock().unwrap();
         // Stop/pause sets its flag before taking this same lock.  Late worker
         // frames cannot restore a reading after the UI has been reset.
-        if capture_active(self, control) {
+        if capture_active(self, control) && ui.target_epoch == target_epoch {
             ui.apply_input_frame(frame, reading, system_silenced);
         }
     }
@@ -859,10 +846,10 @@ impl AppState {
     }
 
     fn sync_views(&self, env: &mut JNIEnv, force: bool) {
-        let action_checked = self.listening_requested.load(Ordering::SeqCst);
-        let action_enabled = !self.permission_request_in_flight.load(Ordering::SeqCst);
         let mut last_synced = self.last_synced.lock().unwrap();
         let ui = self.ui.lock().unwrap();
+        let action_checked = self.listening_requested.load(Ordering::SeqCst);
+        let action_enabled = !self.permission_request_in_flight.load(Ordering::SeqCst);
         if !force
             && last_synced.as_ref().is_some_and(|last| {
                 last.snapshot.revision == ui.revision
@@ -881,6 +868,7 @@ impl AppState {
         let button_changed = old.is_none_or(|old| old.button != snapshot.button);
         let reading_changed = old.is_none_or(|old| {
             old.in_tune != snapshot.in_tune
+                || old.phase != snapshot.phase
                 || old.needle_cents.is_some() != snapshot.needle_cents.is_some()
                 || old.needle_cents.is_some_and(|c| c.abs() > 4.0)
                     != snapshot.needle_cents.is_some_and(|c| c.abs() > 4.0)
@@ -1002,6 +990,10 @@ impl AppState {
                 )?;
             }
             if reading_changed {
+                env.call_method(self.views.gauge_labels[2].as_obj(), "setTextColor", "(I)V",
+                    &[JValue::Int(if snapshot.in_tune { TUNED_GREEN } else { MUTED_TEXT })])?;
+                env.call_method(self.views.needle.as_obj(), "setAlpha", "(F)V",
+                    &[JValue::Float(if snapshot.phase == UiPhase::Fading { 0.38 } else { 1.0 })])?;
                 let accent = if snapshot.in_tune {
                     TUNED_GREEN
                 } else if snapshot.needle_cents.is_some_and(|v| v.abs() > 4.0) {
@@ -1037,6 +1029,7 @@ impl AppState {
                 )?;
             }
             if old.is_none_or(|old| old.selected_target.is_none() != snapshot.selected_target.is_none()) {
+                set_toggle_text(env, self.views.auto.as_obj(), if snapshot.selected_target.is_none() { "自动识别 · 已选" } else { "自动识别" })?;
                 env.call_method(
                     self.views.auto.as_obj(),
                     "setChecked",
@@ -1075,10 +1068,12 @@ impl AppState {
                             &[CHIP_TUNED, PANEL]
                         } else if tint == CHIP_ACTIVE {
                             &[BRASS, CHIP_ACTIVE]
+                        } else if tint == CHIP_DETECTED {
+                            &[CHIP_DETECTED, PANEL]
                         } else {
                             &[CHIP_IDLE, PANEL]
                         },
-                        if tint == CHIP_TUNED { TUNED_GREEN } else if tint == CHIP_ACTIVE {
+                        if tint == CHIP_TUNED { TUNED_GREEN } else if tint == CHIP_ACTIVE || tint == CHIP_DETECTED {
                             BRASS_SOFT
                         } else {
                             PANEL_STROKE
@@ -1103,8 +1098,6 @@ impl AppState {
         });
         clear_exception(env);
         if sync_result.is_ok() {
-            self.last_synced_action_checked
-                .store(action_checked, Ordering::SeqCst);
             *last_synced = Some(SyncedViews {
                 snapshot,
                 action_checked,
@@ -1132,6 +1125,7 @@ fn microphone_indicator(status: InputStatus) -> (&'static str, i32) {
         InputStatus::Starting => ("◌ 正在连接", BRASS_SOFT),
         InputStatus::Receiving => ("● 已收到声音", BRASS_SOFT),
         InputStatus::DigitalSilence => ("○ 已连接 · 无波形", MUTED_TEXT),
+        InputStatus::Stalled => ("○ 输入暂未更新", MUTED_TEXT),
         InputStatus::SystemSilenced => ("! 系统静音", BRASS_SOFT),
     }
 }
@@ -1143,7 +1137,7 @@ fn sync_needle(
     gauge: &JObject,
     needle: &JObject,
     cents: Option<f32>,
-    animate: bool,
+    _animate: bool,
 ) -> JniResult<()> {
     let Some(cents) = cents else {
         let animator = env.call_method(
@@ -1164,31 +1158,11 @@ fn sync_needle(
     if width <= 0 || needle_height <= 0 {
         return Ok(());
     }
-    let angle = (cents.clamp(-50.0, 50.0) / 50.0) * 75.0;
+    let angle = dial::angle(cents);
+    // Tracking already smooths accepted measurements. Apply the exact angle
+    // of the same snapshot used by the text rather than restarting animations.
+    env.call_method(needle, "setRotation", "(F)V", &[JValue::Float(angle)])?;
     env.call_method(needle, "setVisibility", "(I)V", &[JValue::Int(0)])?;
-    if animate {
-        let animator = env.call_method(
-            needle,
-            "animate",
-            "()Landroid/view/ViewPropertyAnimator;",
-            &[],
-        )?.l()?;
-        env.call_method(
-            &animator,
-            "rotation",
-            "(F)Landroid/view/ViewPropertyAnimator;",
-            &[JValue::Float(angle)],
-        )?;
-        env.call_method(
-            &animator,
-            "setDuration",
-            "(J)Landroid/view/ViewPropertyAnimator;",
-            &[JValue::Long(130)],
-        )?;
-        env.call_method(&animator, "start", "()V", &[])?;
-    } else {
-        env.call_method(needle, "setRotation", "(F)V", &[JValue::Float(angle)])?;
-    }
     Ok(())
 }
 
@@ -1196,8 +1170,10 @@ fn chip_tint(snapshot: &UiSnapshot, index: usize) -> i32 {
     let active = snapshot.active_target == Some(index);
     if active && snapshot.in_tune {
         CHIP_TUNED
-    } else if active || snapshot.selected_target == Some(index) {
+    } else if snapshot.selected_target == Some(index) {
         CHIP_ACTIVE
+    } else if active && snapshot.needle_cents.is_some() && snapshot.phase == UiPhase::Reading {
+        CHIP_DETECTED
     } else {
         CHIP_IDLE
     }
@@ -1326,6 +1302,8 @@ fn read_audio_record(
     let buffer = env.new_short_array(FRAME_SIZE as i32)?;
     let mut samples = vec![0_i16; FRAME_SIZE];
     let mut filled = 0;
+    let mut target_epoch = app.ui.lock().unwrap().target_epoch;
+    let mut skip_window = false;
     let mut analyzer = PitchAnalyzer::default();
     let started_at = Instant::now();
     let mut watchdog = FrameWatchdog::new(Duration::ZERO);
@@ -1339,6 +1317,13 @@ fn read_audio_record(
 
     while capture_active(app, control) {
         let now = started_at.elapsed();
+        let current_epoch = app.ui.lock().unwrap().target_epoch;
+        if current_epoch != target_epoch {
+            // No analysis-window PCM from the former selection enters the new target.
+            filled = 0;
+            skip_window = true; // discard queued recorder PCM from the old selection
+            target_epoch = current_epoch;
+        }
         if mute_checked_at.is_none_or(|last| now.saturating_sub(last) >= Duration::from_millis(500))
         {
             mute_observation = capture_is_system_silenced(env, app, record, sdk);
@@ -1347,6 +1332,12 @@ fn read_audio_record(
                 system_silenced = muted;
             }
             mute_checked_at = Some(now);
+            if was_silenced != system_silenced {
+                filled = 0;
+                skip_window = !system_silenced;
+                silence_watchdog.observe_frame(now, &[], true, false);
+                // A previously proven source remains proven across system mute.
+            }
             if system_silenced {
                 app.show_capture_status(control, true);
             } else if was_silenced {
@@ -1382,6 +1373,12 @@ fn read_audio_record(
             env.get_short_array_region(&buffer, 0, &mut samples[filled..filled + read_len])?;
             filled += read_len;
             if filled == FRAME_SIZE {
+                if skip_window {
+                    skip_window = false;
+                    filled = 0;
+                    watchdog.frame_received(started_at.elapsed());
+                    continue;
+                }
                 let frame = InputFrame::from_pcm(&samples).expect("complete PCM frame");
                 let signal = silence_watchdog.observe_frame(
                     now,
@@ -1392,7 +1389,7 @@ fn read_audio_record(
                 if signal == CaptureSignalStatus::ZeroSignalTimeout {
                     startup_log(
                         5,
-                        "audio delivered constant PCM for 2 seconds; trying fallback",
+                        "audio startup delivered only constant PCM; trying fallback",
                     );
                     return Ok(CaptureAttempt::NoWaveform);
                 }
@@ -1401,7 +1398,7 @@ fn read_audio_record(
                 } else {
                     analyzer.analyze_pcm(&samples, sample_rate as f32)
                 };
-                app.apply_input_frame(control, frame, reading, system_silenced);
+                app.apply_input_frame(control, frame, reading, system_silenced, target_epoch);
                 frames = frames.saturating_add(1);
                 if frames == 1 || now.saturating_sub(diagnostic_at) >= Duration::from_secs(5) {
                     // Aggregate metadata only; PCM is never written or logged.
@@ -1411,7 +1408,8 @@ fn read_audio_record(
                     ));
                     diagnostic_at = now;
                 }
-                filled = 0;
+                samples.copy_within(ANALYSIS_HOP..FRAME_SIZE, 0);
+                filled = FRAME_SIZE - ANALYSIS_HOP;
                 // Complete frames and waveform delivery are distinct. Only
                 // digitally constant PCM triggers signal fallback; a quiet
                 // varying waveform or missing pitch never changes sources.
@@ -1440,7 +1438,7 @@ fn input_loop(app: Arc<AppState>, running: Arc<AtomicBool>, queue_addr: usize) {
             && app.running.load(Ordering::SeqCst)
             && app.resumed.load(Ordering::SeqCst)
         {
-            let ident = ALooper_pollOnce(100, ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
+            let ident = ALooper_pollOnce(16, ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
             if ident == INPUT_QUEUE_IDENT {
                 drain_input_queue(&app, queue, &mut gesture);
             }
@@ -1467,10 +1465,15 @@ unsafe fn drain_input_queue(
         if AInputEvent_getType(event) == AINPUT_EVENT_TYPE_MOTION {
             handled = 1;
             let action = AMotionEvent_getAction(event) & AMOTION_EVENT_ACTION_MASK;
+            if !matches!(action, AMOTION_EVENT_ACTION_DOWN | AMOTION_EVENT_ACTION_UP | AMOTION_EVENT_ACTION_MOVE | AMOTION_EVENT_ACTION_CANCEL | AMOTION_EVENT_ACTION_POINTER_DOWN | 6) {
+                AInputQueue_finishEvent(queue, event, 0); // hover/scroll accessibility dispatch
+                continue;
+            }
             if AMotionEvent_getPointerCount(event) != 1
                 || action == AMOTION_EVENT_ACTION_POINTER_DOWN
             {
                 gesture.active = false;
+                app.pending_inputs.lock().unwrap().push_back(PendingInput::ClearPress);
                 AInputQueue_finishEvent(queue, event, handled);
                 continue;
             }
@@ -1483,6 +1486,7 @@ unsafe fn drain_input_queue(
                     gesture.down_y = y;
                     gesture.last_y = y;
                     gesture.moved = false;
+                    app.pending_inputs.lock().unwrap().push_back(PendingInput::Press { x, y });
                 }
                 AMOTION_EVENT_ACTION_MOVE if gesture.active => {
                     let total_x = (x - gesture.down_x).abs();
@@ -1498,7 +1502,9 @@ unsafe fn drain_input_queue(
                     };
                     gesture.last_y = y;
                     if gesture.moved {
-                        *app.pending_scroll_y.lock().unwrap() += delta;
+                        app.pending_inputs.lock().unwrap().push_back(PendingInput::Scroll {
+                            down_x: gesture.down_x, down_y: gesture.down_y, delta,
+                        });
                     }
                 }
                 AMOTION_EVENT_ACTION_UP if gesture.active => {
@@ -1508,14 +1514,19 @@ unsafe fn drain_input_queue(
                         && total_x <= app.views.touch_slop_px
                         && total_y <= app.views.touch_slop_px
                     {
-                        *app.pending_touch.lock().unwrap() = Some((x, y));
+                        app.pending_inputs.lock().unwrap().push_back(PendingInput::Tap {
+                            down_x: gesture.down_x, down_y: gesture.down_y, x, y,
+                        });
                     } else {
-                        *app.pending_scroll_y.lock().unwrap() += gesture.last_y - y;
+                        app.pending_inputs.lock().unwrap().push_back(PendingInput::Scroll {
+                            down_x: gesture.down_x, down_y: gesture.down_y, delta: gesture.last_y - y,
+                        });
                     }
                     gesture.active = false;
                 }
                 AMOTION_EVENT_ACTION_CANCEL => {
                     gesture.active = false;
+                    app.pending_inputs.lock().unwrap().push_back(PendingInput::ClearPress);
                 }
                 _ => {}
             }
@@ -1773,8 +1784,15 @@ fn create_ui<'local>(
         "(Ljava/lang/CharSequence;)V",
         &[JValue::Object(&root_description_obj)],
     )?;
+    let body = new_linear_layout(env, activity, VERTICAL)?;
+    let body_params = linear_params(env, MATCH_PARENT, 0, Some(1.0), [0; 4])?;
+    add_view(env, &shell, &body, body_params)?;
+    let hero = new_linear_layout(env, activity, VERTICAL)?;
+    env.call_method(&hero, "setGravity", "(I)V", &[JValue::Int(GRAVITY_CENTER_HORIZONTAL)])?;
+    add_with_height(env, &body, &hero, MATCH_PARENT, WRAP_CONTENT,
+        [dp(12.0), dp(4.0), dp(12.0), dp(3.0)])?;
     let scroll_params = linear_params(env, MATCH_PARENT, 0, Some(1.0), [0; 4])?;
-    add_view(env, &shell, &scroll, scroll_params)?;
+    add_view(env, &body, &scroll, scroll_params)?;
 
     let content = new_linear_layout(env, activity, VERTICAL)?;
     env.call_method(
@@ -1788,78 +1806,36 @@ fn create_ui<'local>(
         "setPadding",
         "(IIII)V",
         &[
-            JValue::Int(dp(16.0)),
             JValue::Int(dp(12.0)),
-            JValue::Int(dp(16.0)),
-            JValue::Int(dp(20.0)),
+            JValue::Int(dp(3.0)),
+            JValue::Int(dp(12.0)),
+            JValue::Int(dp(8.0)),
         ],
     )?;
     let content_params = linear_params(env, MATCH_PARENT, WRAP_CONTENT, None, [0; 4])?;
     add_view(env, &scroll, &content, content_params)?;
 
-    let title = new_text_view(
-        env,
-        activity,
-        "✦  弦准  ✦",
-        25.0,
-        BRASS_SOFT,
-        true,
-        GRAVITY_CENTER,
-    )?;
+    let header = new_linear_layout(env, activity, HORIZONTAL)?;
+    env.call_method(&header, "setGravity", "(I)V", &[JValue::Int(GRAVITY_CENTER)])?;
+    add_with_height(env, &hero, &header, MATCH_PARENT, WRAP_CONTENT, [0, 0, 0, dp(3.0)])?;
+    let title = new_text_view(env, activity, "弦准", 19.0, BRASS_SOFT, true, GRAVITY_CENTER)?;
     set_serif_font(env, &title, true)?;
-    add_with_height(
-        env,
-        &content,
-        &title,
-        MATCH_PARENT,
-        WRAP_CONTENT,
-        [0, 0, 0, dp(3.0)],
-    )?;
-    let subtitle = new_text_view(
-        env,
-        activity,
-        "古典吉他 · 标准调弦",
-        13.0,
-        MUTED_TEXT,
-        false,
-        GRAVITY_CENTER,
-    )?;
-    add_with_height(
-        env,
-        &content,
-        &subtitle,
-        MATCH_PARENT,
-        WRAP_CONTENT,
-        [0, 0, 0, dp(10.0)],
-    )?;
-
-
-    // Mic state is placed above the dial. Signal delivery and actual pitch
-    // recognition are distinct; silence must not be presented as a tuned note.
+    let title_params = linear_params(env, 0, WRAP_CONTENT, Some(0.5), [0; 4])?;
+    add_view(env, &header, &title, title_params)?;
     let microphone = new_text_view(
-        env, activity, "○ 麦克风待机", 12.0, BRASS_SOFT, false, GRAVITY_CENTER,
+        env, activity, "○ 麦克风待机", 12.0, MUTED_TEXT, false, GRAVITY_CENTER,
     )?;
-    set_gradient_background(
-        env, &microphone, &[CHIP_IDLE, PANEL], PANEL_STROKE, dp(18.0) as f32, dp(1.0),
-    )?;
-    env.call_method(
-        &microphone,
-        "setPadding",
-        "(IIII)V",
-        &[
-            JValue::Int(dp(12.0)), JValue::Int(dp(8.0)),
-            JValue::Int(dp(12.0)), JValue::Int(dp(8.0)),
-        ],
-    )?;
-    add_with_height(env, &content, &microphone, WRAP_CONTENT, WRAP_CONTENT, [0, 0, 0, dp(12.0)])?;
+    env.call_method(&microphone, "setSingleLine", "(Z)V", &[JValue::Bool(1)])?;
+    let mic_params = linear_params(env, 0, WRAP_CONTENT, Some(1.0), [0; 4])?;
+    add_view(env, &header, &microphone, mic_params)?;
 
     let card = new_linear_layout(env, activity, VERTICAL)?;
     env.call_method(&card, "setGravity", "(I)V", &[JValue::Int(GRAVITY_CENTER)])?;
     env.call_method(
         &card, "setPadding", "(IIII)V",
         &[
-            JValue::Int(dp(11.0)), JValue::Int(dp(14.0)),
-            JValue::Int(dp(11.0)), JValue::Int(dp(12.0)),
+            JValue::Int(dp(8.0)), JValue::Int(dp(4.0)),
+            JValue::Int(dp(8.0)), JValue::Int(dp(4.0)),
         ],
     )?;
     set_gradient_background(
@@ -1867,31 +1843,29 @@ fn create_ui<'local>(
         PANEL_STROKE, dp(23.0) as f32, dp(1.0),
     )?;
     env.call_method(&card, "setElevation", "(F)V", &[JValue::Float(dp(4.0) as f32)])?;
-    add_with_height(env, &content, &card, MATCH_PARENT, WRAP_CONTENT, [0, 0, 0, dp(14.0)])?;
+    add_with_height(env, &hero, &card, MATCH_PARENT, WRAP_CONTENT, [0; 4])?;
 
-    let note = new_text_view(env, activity, "待拨弦", 68.0, WARM_WHITE, true, GRAVITY_CENTER)?;
+    let note = new_text_view(env, activity, "待拨弦", 48.0, WARM_WHITE, true, GRAVITY_CENTER)?;
     set_serif_font(env, &note, true)?;
     env.call_method(&note, "setSingleLine", "(Z)V", &[JValue::Bool(1)])?;
     env.call_method(
         &note,
         "setAutoSizeTextTypeUniformWithConfiguration",
         "(IIII)V",
-        &[JValue::Int(28), JValue::Int(68), JValue::Int(2), JValue::Int(TEXT_UNIT_SP)],
+        &[JValue::Int(24), JValue::Int(48), JValue::Int(2), JValue::Int(TEXT_UNIT_SP)],
     )?;
-    add_with_height(env, &card, &note, MATCH_PARENT, WRAP_CONTENT, [0, 0, 0, dp(1.0)])?;
+    add_with_height(env, &card, &note, MATCH_PARENT, dp(52.0), [0; 4])?;
 
     let caption = new_text_view(
         env, activity, "自动识别", 15.0, BRASS_SOFT, false, GRAVITY_CENTER,
     )?;
-    add_with_height(env, &card, &caption, MATCH_PARENT, WRAP_CONTENT, [0, 0, 0, dp(9.0)])?;
+    add_with_height(env, &card, &caption, MATCH_PARENT, WRAP_CONTENT, [0, 0, 0, dp(2.0)])?;
 
-    // Screen width sets a predictable dial aspect ratio and pivot geometry.
-    // The SVG-like vector is drawn by Android's own VectorDrawable engine.
-    let usable_width = display_width_px(env, activity).unwrap_or(dp(360.0)) - dp(70.0);
-    let dial_width = usable_width.max(dp(170.0)).min(dp(360.0));
-    let dial_height = ((dial_width as f32) * (200.0 / 360.0)).round() as i32;
-    let needle_height = ((dial_width as f32) * (119.0 / 360.0)).round() as i32;
-    let needle_bottom = ((dial_width as f32) * (19.0 / 360.0)).round() as i32;
+    let dial_width = responsive_dial_width(env, activity, density);
+    let scale = dial_width as f32 / dial::WIDTH;
+    let dial_height = (dial::HEIGHT * scale).round() as i32;
+    let needle_height = (dial::NEEDLE_RADIUS * scale).round() as i32;
+    let needle_bottom = ((dial::HEIGHT - dial::PIVOT_Y) * scale).round() as i32;
 
     let gauge = env.new_object(
         "android/widget/FrameLayout",
@@ -1990,40 +1964,34 @@ fn create_ui<'local>(
     add_view(env, &gauge, &pivot, pivot_params)?;
     add_with_height(env, &card, &gauge, dial_width, dial_height, [0, 0, 0, dp(2.0)])?;
 
-    let scale = new_linear_layout(env, activity, HORIZONTAL)?;
-    for label in ["−50", "−25", "0", "+25", "+50"] {
-        let marker = new_text_view(
-            env, activity, label, 11.0,
-            if label == "0" { TUNED_GREEN } else { MUTED_TEXT },
-            false, GRAVITY_CENTER,
-        )?;
-        let params = linear_params(env, 0, WRAP_CONTENT, Some(1.0), [0; 4])?;
-        add_view(env, &scale, &marker, params)?;
+    let mut label_refs = Vec::with_capacity(5);
+    for (cents, label) in dial::LABEL_CENTS.into_iter().zip(["−50", "−25", "0", "+25", "+50"]) {
+        let marker = new_text_view(env, activity, label, (dial_width as f32 / density / 29.0).clamp(7.0, 11.0), MUTED_TEXT, false, GRAVITY_CENTER)?;
+        env.call_method(&marker, "setSingleLine", "(Z)V", &[JValue::Bool(1)])?;
+        env.call_method(&marker, "setImportantForAccessibility", "(I)V", &[JValue::Int(2)])?;
+        let params = dial_label_params(env, cents, dial_width)?;
+        add_view(env, &gauge, &marker, params)?;
+        label_refs.push(env.new_global_ref(&marker)?);
     }
-    add_with_height(env, &card, &scale, dial_width, WRAP_CONTENT, [0, 0, 0, dp(3.0)])?;
-    let flat_sharp = new_linear_layout(env, activity, HORIZONTAL)?;
-    for label in ["偏低    ♭", "♯    偏高"] {
-        let view = new_text_view(env, activity, label, 12.0, MUTED_TEXT, false, GRAVITY_CENTER)?;
-        let params = linear_params(env, 0, WRAP_CONTENT, Some(1.0), [0; 4])?;
-        add_view(env, &flat_sharp, &view, params)?;
-    }
-    add_with_height(env, &card, &flat_sharp, dial_width, WRAP_CONTENT, [0, 0, 0, dp(12.0)])?;
+    let gauge_labels: [GlobalRef; 5] = label_refs.try_into()
+        .map_err(|_| jni::errors::Error::NullPtr("dial label array"))?;
 
     let cents = new_text_view(
-        env, activity, "— 音分", 24.0, BRASS_SOFT, true, GRAVITY_CENTER,
+        env, activity, "— 音分", 22.0, BRASS_SOFT, true, GRAVITY_CENTER,
     )?;
     env.call_method(&cents, "setSingleLine", "(Z)V", &[JValue::Bool(1)])?;
     env.call_method(
         &cents, "setAutoSizeTextTypeUniformWithConfiguration", "(IIII)V",
-        &[JValue::Int(14), JValue::Int(24), JValue::Int(1), JValue::Int(TEXT_UNIT_SP)],
+        &[JValue::Int(12), JValue::Int(22), JValue::Int(1), JValue::Int(TEXT_UNIT_SP)],
     )?;
-    add_with_height(env, &card, &cents, MATCH_PARENT, WRAP_CONTENT, [0, 0, 0, dp(3.0)])?;
+    add_with_height(env, &card, &cents, MATCH_PARENT, dp(32.0), [0; 4])?;
 
     let status = new_text_view(
         env, activity, "点开始，再拨一根空弦", 15.0, WARM_WHITE, false, GRAVITY_CENTER,
     )?;
     env.call_method(&status, "setMinLines", "(I)V", &[JValue::Int(2)])?;
-    add_with_height(env, &card, &status, MATCH_PARENT, WRAP_CONTENT, [0, 0, 0, dp(7.0)])?;
+    env.call_method(&status, "setMaxLines", "(I)V", &[JValue::Int(2)])?;
+    add_with_height(env, &card, &status, MATCH_PARENT, WRAP_CONTENT, [0; 4])?;
 
     let frequency = new_text_view(
         env, activity, "检测 — Hz  ·  目标 — Hz", 13.0, MUTED_TEXT, false, GRAVITY_CENTER,
@@ -2039,18 +2007,18 @@ fn create_ui<'local>(
             JValue::Int(dp(8.0)), JValue::Int(dp(9.0)),
         ],
     )?;
-    add_with_height(env, &card, &frequency, MATCH_PARENT, WRAP_CONTENT, [0, 0, 0, dp(10.0)])?;
+    add_with_height(env, &content, &frequency, MATCH_PARENT, WRAP_CONTENT, [0, 0, 0, dp(3.0)])?;
 
     let level = new_text_view(
         env, activity, "等待声音", 12.0, MUTED_TEXT, false, GRAVITY_CENTER,
     )?;
-    add_with_height(env, &card, &level, MATCH_PARENT, WRAP_CONTENT, [0; 4])?;
+    add_with_height(env, &content, &level, MATCH_PARENT, WRAP_CONTENT, [0, 0, 0, dp(5.0)])?;
 
     let select_title = new_text_view(
         env,
         activity,
-        "◇  选择琴弦  ◇",
-        17.0,
+        "目标琴弦",
+        15.0,
         WARM_WHITE,
         true,
         GRAVITY_CENTER,
@@ -2064,24 +2032,6 @@ fn create_ui<'local>(
         WRAP_CONTENT,
         [0, 0, 0, dp(2.0)],
     )?;
-    let select_hint = new_text_view(
-        env,
-        activity,
-        "手动锁定目标琴弦，或使用自动识别",
-        12.0,
-        MUTED_TEXT,
-        false,
-        GRAVITY_CENTER,
-    )?;
-    add_with_height(
-        env,
-        &content,
-        &select_hint,
-        MATCH_PARENT,
-        WRAP_CONTENT,
-        [0, 0, 0, dp(8.0)],
-    )?;
-
     let auto = new_toggle(env, activity, "自动识别", 15.0, WARM_WHITE, dp(48.0))?;
     set_tactile_background(
         env, &auto, &[CHIP_ACTIVE, PANEL], BRASS_SOFT, dp(16.0) as f32, dp(1.0),
@@ -2111,7 +2061,7 @@ fn create_ui<'local>(
     let mut chip_refs = Vec::with_capacity(6);
     for (index, target) in STRINGS.iter().enumerate() {
         let label = format!("{}\n{}弦", target.note, STRINGS.len() - index);
-        let chip = new_toggle(env, activity, &label, 16.0, WARM_WHITE, dp(62.0))?;
+        let chip = new_toggle(env, activity, &label, 15.0, WARM_WHITE, dp(48.0))?;
         env.call_method(&chip, "setMinWidth", "(I)V", &[JValue::Int(0)])?;
         env.call_method(&chip, "setMinimumWidth", "(I)V", &[JValue::Int(0)])?;
         env.call_method(
@@ -2120,9 +2070,9 @@ fn create_ui<'local>(
             "(IIII)V",
             &[
                 JValue::Int(dp(4.0)),
-                JValue::Int(dp(8.0)),
+                JValue::Int(dp(3.0)),
                 JValue::Int(dp(4.0)),
-                JValue::Int(dp(8.0)),
+                JValue::Int(dp(3.0)),
             ],
         )?;
         let description = env.new_string(format!(
@@ -2145,7 +2095,7 @@ fn create_ui<'local>(
         chip_refs.push(env.new_global_ref(&chip)?);
     }
 
-    let footer_text = format!("古典吉他 · 标准调弦   |   v{} · 本机处理", env!("CARGO_PKG_VERSION"));
+    let footer_text = format!("标准调弦 · v{}", env!("CARGO_PKG_VERSION"));
     let footer = new_text_view(
         env,
         activity,
@@ -2159,7 +2109,7 @@ fn create_ui<'local>(
 
     // Keep the primary action reachable with one hand even when the content
     // scrolls on a smaller device or at a larger system font scale.
-    let action = new_toggle(env, activity, "开始调音", 19.0, MIDNIGHT, dp(58.0))?;
+    let action = new_toggle(env, activity, "开始调音", 18.0, MIDNIGHT, dp(52.0))?;
     set_serif_font(env, &action, true)?;
     set_tactile_background(
         env, &action, &[BRASS_SOFT, BRASS], BRASS_SOFT, dp(20.0) as f32, dp(2.0),
@@ -2174,7 +2124,7 @@ fn create_ui<'local>(
         &action,
         MATCH_PARENT,
         WRAP_CONTENT,
-        [dp(16.0), dp(8.0), dp(16.0), dp(12.0)],
+        [dp(12.0), dp(3.0), dp(12.0), dp(6.0)],
     )?;
 
     env.call_method(
@@ -2190,6 +2140,8 @@ fn create_ui<'local>(
     Ok(OverlayViews {
         root: env.new_global_ref(&shell)?,
         scroll: env.new_global_ref(&scroll)?,
+        body: env.new_global_ref(&body)?,
+        hero: env.new_global_ref(&hero)?,
         action: env.new_global_ref(&action)?,
         auto: env.new_global_ref(&auto)?,
         note: env.new_global_ref(&note)?,
@@ -2201,6 +2153,8 @@ fn create_ui<'local>(
         microphone: env.new_global_ref(&microphone)?,
         gauge: env.new_global_ref(&gauge)?,
         needle: env.new_global_ref(&needle)?,
+        pivot: env.new_global_ref(&pivot)?,
+        gauge_labels,
         chips,
         touch_slop_px: scaled_touch_slop(env, activity).unwrap_or(dp(8.0) as f32),
     })
@@ -2397,24 +2351,6 @@ fn set_toggle_text(env: &mut JNIEnv, view: &JObject, text: &str) -> JniResult<()
     Ok(())
 }
 
-fn set_background_tint(env: &mut JNIEnv, view: &JObject, color: i32) -> JniResult<()> {
-    let tint = env
-        .call_static_method(
-            "android/content/res/ColorStateList",
-            "valueOf",
-            "(I)Landroid/content/res/ColorStateList;",
-            &[JValue::Int(color)],
-        )?
-        .l()?;
-    env.call_method(
-        view,
-        "setBackgroundTintList",
-        "(Landroid/content/res/ColorStateList;)V",
-        &[JValue::Object(&tint)],
-    )?;
-    Ok(())
-}
-
 fn scaled_touch_slop(env: &mut JNIEnv, activity: &JObject) -> Option<f32> {
     let result = (|| -> JniResult<f32> {
         let configuration = env
@@ -2520,14 +2456,101 @@ fn set_tactile_background(
     Ok(())
 }
 
-fn display_width_px(env: &mut JNIEnv, activity: &JObject) -> Option<i32> {
-    let result = (|| -> JniResult<i32> {
+fn display_size(env: &mut JNIEnv, activity: &JObject, density: f32) -> (i32, i32) {
+    let metrics = (|| -> JniResult<(i32, i32)> {
         let resources = env.call_method(activity, "getResources", "()Landroid/content/res/Resources;", &[])?.l()?;
         let metrics = env.call_method(&resources, "getDisplayMetrics", "()Landroid/util/DisplayMetrics;", &[])?.l()?;
-        env.get_field(&metrics, "widthPixels", "I")?.i()
+        Ok((env.get_field(&metrics, "widthPixels", "I")?.i()?,
+            env.get_field(&metrics, "heightPixels", "I")?.i()?))
     })();
     clear_exception(env);
-    result.ok().filter(|width| *width > 0)
+    metrics.unwrap_or(((360.0*density) as i32, (700.0*density) as i32))
+}
+
+fn wide_body(width: i32, height: i32, density: f32) -> bool {
+    width > height && width as f32 / density >= 520.0
+}
+
+fn responsive_dial_width(env: &mut JNIEnv, activity: &JObject, density: f32) -> i32 {
+    let (width, height) = display_size(env, activity, density);
+    let side = (40.0*density).round() as i32;
+    let available_width = if wide_body(width, height, density) { width / 2 } else { width };
+    (available_width - side).min((height as f32 * 0.46).round() as i32)
+        .min((320.0*density) as i32).max(1)
+}
+
+fn dial_label_params<'local>(env: &mut JNIEnv<'local>, cents: f32, width: i32) -> JniResult<JObject<'local>> {
+    let scale = width as f32 / dial::WIDTH;
+    let label_width = (48.0 * scale).round() as i32;
+    let label_height = (28.0 * scale).round() as i32;
+    let (x, y) = dial::label_center(cents);
+    let params = env.new_object("android/widget/FrameLayout$LayoutParams", "(III)V",
+        &[JValue::Int(label_width), JValue::Int(label_height), JValue::Int(51)])?;
+    env.call_method(&params, "setMargins", "(IIII)V", &[
+        JValue::Int((x * scale).round() as i32 - label_width / 2),
+        JValue::Int((y * scale).round() as i32 - label_height / 2),
+        JValue::Int(0), JValue::Int(0),
+    ])?;
+    Ok(params)
+}
+
+fn resize_dial(env: &mut JNIEnv, app: &AppState) -> JniResult<()> {
+    let density = display_density(env, app.activity.as_obj()).max(1.0);
+    let (screen_w, screen_h) = display_size(env, app.activity.as_obj(), density);
+    let wide = wide_body(screen_w, screen_h, density);
+    let dp = |v: f32| (v * density).round() as i32;
+    env.call_method(app.views.body.as_obj(), "setOrientation", "(I)V",
+        &[JValue::Int(if wide { HORIZONTAL } else { VERTICAL })])?;
+    let hero_params = linear_params(env, if wide { 0 } else { MATCH_PARENT }, WRAP_CONTENT,
+        if wide { Some(1.0) } else { None }, [dp(12.0), dp(4.0), dp(12.0), dp(3.0)])?;
+    let scroll_params = linear_params(env, if wide { 0 } else { MATCH_PARENT },
+        if wide { MATCH_PARENT } else { 0 }, Some(1.0), [0; 4])?;
+    for (view, params) in [(&app.views.hero, hero_params), (&app.views.scroll, scroll_params)] {
+        env.call_method(view.as_obj(), "setLayoutParams", "(Landroid/view/ViewGroup$LayoutParams;)V",
+            &[JValue::Object(&params)])?;
+    }
+    for (view, h) in [(&app.views.note, if wide { 38.0 } else { 52.0 }),
+        (&app.views.cents, if wide { 26.0 } else { 32.0 })] {
+        let params = env.call_method(view.as_obj(), "getLayoutParams",
+            "()Landroid/view/ViewGroup$LayoutParams;", &[])?.l()?;
+        env.set_field(&params, "height", "I", JValue::Int(dp(h)))?;
+        env.call_method(view.as_obj(), "setLayoutParams", "(Landroid/view/ViewGroup$LayoutParams;)V",
+            &[JValue::Object(&params)])?;
+    }
+    let width = responsive_dial_width(env, app.activity.as_obj(), density);
+    let scale = width as f32 / dial::WIDTH;
+    let h = (dial::HEIGHT * scale).round() as i32;
+    let needle_h = (dial::NEEDLE_RADIUS * scale).round() as i32;
+    let bottom = ((dial::HEIGHT - dial::PIVOT_Y) * scale).round() as i32;
+    let diameter = (13.0*density).round() as i32;
+    let needle_w = (3.0*density).round() as i32;
+    let params = env.call_method(app.views.gauge.as_obj(), "getLayoutParams",
+        "()Landroid/view/ViewGroup$LayoutParams;", &[])?.l()?;
+    env.set_field(&params, "width", "I", JValue::Int(width))?;
+    env.set_field(&params, "height", "I", JValue::Int(h))?;
+    env.call_method(app.views.gauge.as_obj(), "setLayoutParams",
+        "(Landroid/view/ViewGroup$LayoutParams;)V", &[JValue::Object(&params)])?;
+    for (view, w, h, margin) in [
+        (&app.views.needle, needle_w, needle_h, bottom),
+        (&app.views.pivot, diameter, diameter, (bottom - diameter/2).max(0)),
+    ] {
+        let params = env.new_object("android/widget/FrameLayout$LayoutParams", "(III)V",
+            &[JValue::Int(w), JValue::Int(h), JValue::Int(81)])?;
+        env.call_method(&params, "setMargins", "(IIII)V",
+            &[JValue::Int(0), JValue::Int(0), JValue::Int(0), JValue::Int(margin)])?;
+        env.call_method(view.as_obj(), "setLayoutParams", "(Landroid/view/ViewGroup$LayoutParams;)V",
+            &[JValue::Object(&params)])?;
+    }
+    env.call_method(app.views.needle.as_obj(), "setPivotX", "(F)V", &[JValue::Float(needle_w as f32/2.0)])?;
+    env.call_method(app.views.needle.as_obj(), "setPivotY", "(F)V", &[JValue::Float(needle_h as f32)])?;
+    for (view, cents) in app.views.gauge_labels.iter().zip(dial::LABEL_CENTS) {
+        let params = dial_label_params(env, cents, width)?;
+        env.call_method(view.as_obj(), "setLayoutParams", "(Landroid/view/ViewGroup$LayoutParams;)V",
+            &[JValue::Object(&params)])?;
+        env.call_method(view.as_obj(), "setTextSize", "(IF)V",
+            &[JValue::Int(TEXT_UNIT_SP), JValue::Float((width as f32 / density / 29.0).clamp(7.0, 11.0))])?;
+    }
+    Ok(())
 }
 
 fn set_serif_font(env: &mut JNIEnv, view: &JObject, bold: bool) -> JniResult<()> {
@@ -2703,10 +2726,10 @@ fn prepare_view_window(env: &mut JNIEnv, activity: &JObject) -> JniResult<()> {
     let window = env
         .call_method(activity, "getWindow", "()Landroid/view/Window;", &[])?
         .l()?;
-    // NativeActivity takes the window surface and input queue before calling
-    // this Rust entry point.  Our UI uses framework Views: return both to the
-    // framework before its first ViewRoot is attached, or it will never draw
-    // those Views and will bypass their normal touch dispatch.
+    // Return the surface for framework View rendering, but keep NativeActivity's
+    // input queue for ordered Rust touch commands. Handled motion events are
+    // not delivered again to ToggleButton; keyboard/accessibility still work
+    // through the framework fallback.
     env.call_method(
         &window,
         "takeSurface",
@@ -2717,11 +2740,11 @@ fn prepare_view_window(env: &mut JNIEnv, activity: &JObject) -> JniResult<()> {
         &window,
         "takeInputQueue",
         "(Landroid/view/InputQueue$Callback;)V",
-        &[JValue::Object(&JObject::null())],
+        &[JValue::Object(activity)],
     )?;
     startup_log(
         4,
-        "startup window uses framework drawing and touch dispatch",
+        "startup window uses framework drawing and ordered native touch dispatch",
     );
     Ok(())
 }
@@ -2829,6 +2852,7 @@ pub unsafe extern "C" fn ANativeActivity_onCreate(
     };
 
     let app = AppState::new(vm, activity_ref, views);
+    if resize_dial(&mut env, &app).is_err() { clear_exception(&mut env); }
     app.sync_views(&mut env, true);
     AppState::start_main_loop(&app);
     (*activity).instance = Box::into_raw(Box::new(app)) as *mut c_void;
@@ -2894,6 +2918,9 @@ unsafe extern "C" fn on_input_queue_destroyed(
 unsafe extern "C" fn on_configuration_changed(activity: *mut ANativeActivity) {
     if let Some(app) = app_from_activity(activity) {
         if let Ok(mut env) = app.vm.attach_current_thread() {
+            app.pending_inputs.lock().unwrap().clear();
+            app.update_pressed(&mut env, None);
+            if resize_dial(&mut env, &app).is_err() { clear_exception(&mut env); }
             app.sync_views(&mut env, true);
         }
     }

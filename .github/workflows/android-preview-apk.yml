@@ -32,7 +32,9 @@ jobs:
           PREVIEW_SIGNING_JSON: ${{ secrets.XIANZHUN_PREVIEW_SIGNING_JSON }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:PREVIEW_SIGNING_JSON)) {
-            throw "Missing XIANZHUN_PREVIEW_SIGNING_JSON. Add the one-time signing secret in repository Settings -> Secrets and variables -> Actions. The job will not generate an incompatible debug certificate."
+            "HAS_PREVIEW_SIGNING=false" >> $env:GITHUB_ENV
+            Write-Output "No repository signing secret. Build an unsigned intermediate for offline signing only; never generate an ephemeral certificate."
+            return
           }
           $config = $env:PREVIEW_SIGNING_JSON | ConvertFrom-Json -ErrorAction Stop
           if ([string]::IsNullOrWhiteSpace($config.keystoreBase64) -or
@@ -51,6 +53,7 @@ jobs:
           "XIANZHUN_PREVIEW_STORE_PASSWORD=$($config.storePassword)" >> $env:GITHUB_ENV
           "XIANZHUN_PREVIEW_KEY_ALIAS=$($config.keyAlias)" >> $env:GITHUB_ENV
           "XIANZHUN_PREVIEW_KEY_PASSWORD=$($config.keyPassword)" >> $env:GITHUB_ENV
+          "HAS_PREVIEW_SIGNING=true" >> $env:GITHUB_ENV
           Write-Output "Permanent preview signing material loaded without exposing the private key."
 
       - name: Checkout public repository
@@ -103,13 +106,18 @@ jobs:
           cargo "+$env:XIANZHUN_RUST_TOOLCHAIN" fetch --locked --manifest-path rust/Cargo.toml
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Build installable signed preview APK
+      - name: Build signed preview or unsigned offline intermediate
         shell: pwsh
         run: |
-          .\gradlew.bat --no-daemon :app:assemblePreview
+          if ($env:HAS_PREVIEW_SIGNING -eq "true") {
+            .\gradlew.bat --no-daemon :app:assemblePreview
+          } else {
+            .\gradlew.bat --no-daemon :app:assembleUnsignedPreview
+          }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Validate signer, application identity and native ABIs
+        if: env.HAS_PREVIEW_SIGNING == 'true'
         shell: pwsh
         run: |
           $apks = @(Get-ChildItem "app/build/outputs/apk/preview" -Filter "xianzhun-preview-v*.apk" -File)
@@ -150,12 +158,48 @@ jobs:
           "Signing: pinned permanent preview certificate ($expected), not the ephemeral debug key or production key." >> $env:GITHUB_STEP_SUMMARY
 
       - name: Publish downloadable APK artifact
+        if: env.HAS_PREVIEW_SIGNING == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: xianzhun-preview-apk-${{ github.event.pull_request.number || github.run_number }}
           path: app/build/outputs/apk/preview/xianzhun-preview-v*.apk
           if-no-files-found: error
           retention-days: 30
+
+      - name: Validate unsigned offline-signing intermediate
+        if: env.HAS_PREVIEW_SIGNING == 'false'
+        shell: pwsh
+        run: |
+          $apks = @(Get-ChildItem "app/build/outputs/apk/unsignedPreview" -Filter "xianzhun-unsigned-preview-v*.apk" -File)
+          if ($apks.Count -ne 1) { throw "Expected exactly one unsigned intermediate" }
+          $apk = $apks[0].FullName
+          $tools = Join-Path $env:ANDROID_SDK_ROOT "build-tools\36.0.0"
+          $badging = & (Join-Path $tools "aapt.exe") dump badging $apk
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not ($badging -match "name='com.ofairyo.xianzhun.preview'")) { throw "Wrong intermediate application ID" }
+          & (Join-Path $tools "zipalign.exe") -c -P 16 4 $apk
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($apk)
+          try {
+            $entries = @($zip.Entries | ForEach-Object { $_.FullName })
+            foreach ($abi in @("arm64-v8a", "armeabi-v7a", "x86_64")) {
+              if ($entries -notcontains "lib/$abi/libxianzhun_tuner.so") { throw "Missing native library: $abi" }
+            }
+          } finally { $zip.Dispose() }
+          New-Item -ItemType Directory -Force -Path offline-signing | Out-Null
+          Copy-Item -LiteralPath $apk -Destination offline-signing
+          Copy-Item -LiteralPath (Join-Path $tools "lib\apksigner.jar") -Destination offline-signing
+          "Unsigned intermediate only. Not installable. Sign privately using the pinned preview certificate; never publish the intermediate as a ready APK." >> $env:GITHUB_STEP_SUMMARY
+          "APK SHA-256: $((Get-FileHash $apk -Algorithm SHA256).Hash)" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload non-installable intermediate for offline signing
+        if: env.HAS_PREVIEW_SIGNING == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: xianzhun-unsigned-offline-intermediate-${{ github.event.pull_request.number || github.run_number }}
+          path: offline-signing/
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Remove temporary signing material
         if: always()

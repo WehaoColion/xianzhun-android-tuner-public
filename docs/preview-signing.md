@@ -25,7 +25,11 @@ Android 更新安装要求新旧 APK 的包名一致，且签名证书相同（�
 | 正式版包名 | `com.ofairyo.xianzhun`，沿用原正式签名 |
 | APK 类型 | 可安装测试预览包，不是正式 Release |
 
-Gradle 构建图发现预览 APK 打包任务时会强制要求长期签名；若密钥缺失、证书不匹配或校验任务被明确排除，立即构建失败，**禁止回退为临时 Debug 签名**。APK 生成后，还会使用 Android Build Tools 的 `apksigner` 校验最终 APK 中的真实证书指纹，验证包名与三个 ABI，成功后才上传可下载安装包。
+Gradle 构建图发现 assemblePreview 的预览 APK 打包任务时会强制要求长期签名；若密钥缺失、证书不匹配或校验任务被明确排除，立即构建失败，**禁止回退为临时 Debug 签名**。APK 生成后，还会使用 Android Build Tools 的 `apksigner` 校验最终 APK 中的真实证书指纹，验证包名与三个 ABI，成功后才上传可下载安装包。
+
+## 离线签名中间产物（0.4.15 起）
+
+如果还未配置 Actions Secret，可信来源的构建可以生成名为 xianzhun-unsigned-offline-intermediate 的中间 ZIP。它内含未签名、不可安装的 APK 和固定 Android SDK Build Tools 的 apksigner.jar，此 ZIP 不应作为可安装 APK 发布。维护人可将中间 APK 使用自己离线保存的原固定预览密钥签名，然后用 apksigner verify --verbose --print-certs 核对证书 SHA-256 与上表严格一致，并核验包名、版本号和三个 ABI。私钥不得放进公开仓库、工作流日志或中间产物。若 Secret 已配置但签名不匹配，工作流直接失败而不降级。配置一次 Secret 后才可以实现无人值守的签名 APK 构建。
 
 ## 更新步骤与注意事项
 

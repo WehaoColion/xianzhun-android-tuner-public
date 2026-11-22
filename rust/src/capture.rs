@@ -138,9 +138,12 @@ pub(crate) enum CaptureSignalStatus {
 /// Detect digital silence independently of the complete-frame watchdog and
 /// pitch recognition: even one-bit waveform changes prove PCM is not constant.
 /// Known system silencing must never cause attempts to bypass capture policy.
+/// After the first real waveform, quiet intervals never justify replacing
+/// a healthy recorder. Complete-frame stalls still use FrameWatchdog.
 #[derive(Default)]
 pub(crate) struct DigitalSilenceWatchdog {
     constant_since: Option<Duration>,
+    observed_waveform: bool,
 }
 
 impl DigitalSilenceWatchdog {
@@ -170,11 +173,12 @@ impl DigitalSilenceWatchdog {
         };
         if samples.iter().any(|sample| sample != first) {
             self.constant_since = None;
+            self.observed_waveform = true;
             return CaptureSignalStatus::Receiving;
         }
         let started = *self.constant_since.get_or_insert(now);
         if now.saturating_sub(started) >= Self::TIMEOUT {
-            if allow_retry {
+            if allow_retry && !self.observed_waveform {
                 CaptureSignalStatus::ZeroSignalTimeout
             } else {
                 CaptureSignalStatus::NoWaveform
@@ -376,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn a_one_bit_waveform_restores_the_digital_silence_deadline() {
+    fn proven_waveform_prevents_reopening_a_healthy_microphone_in_silence() {
         let mut watchdog = DigitalSilenceWatchdog::new();
         watchdog.observe_frame(Duration::ZERO, &[0; 4096], false, true);
         assert_eq!(
@@ -393,7 +397,7 @@ mod tests {
         );
         assert_eq!(
             watchdog.observe_frame(Duration::from_secs(4), &[0; 4096], false, true),
-            CaptureSignalStatus::ZeroSignalTimeout
+            CaptureSignalStatus::NoWaveform
         );
     }
 
