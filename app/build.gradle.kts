@@ -9,7 +9,7 @@ import org.gradle.api.GradleException
 
 apply(plugin = "com.android.application")
 
-val appVersionName = "0.4.14-stable-preview-sign"
+val appVersionName = "0.4.15-continuous-tuner"
 val requiredCargoNdkVersion = "cargo-ndk 4.1.2"
 val rustToolchain = System.getenv("XIANZHUN_RUST_TOOLCHAIN")
     ?.takeIf { it.isNotBlank() }
@@ -397,7 +397,7 @@ configure<ApplicationExtension> {
         applicationId = "com.ofairyo.xianzhun"
         minSdk = 26
         targetSdk = 36
-        versionCode = 18
+        versionCode = 19
         versionName = appVersionName
 
         vectorDrawables {
@@ -450,12 +450,22 @@ configure<ApplicationExtension> {
             versionNameSuffix = "-preview"
             signingConfig = if (hasPreviewSigning) signingConfigs.getByName("preview") else null
         }
+        // Unsigned, non-installable intermediate for private offline signing
+        // when the trusted owner has not yet configured the Actions secret.
+        // Never distribute this as an installable APK or use a debug key.
+        create("unsignedPreview") {
+            initWith(getByName("preview"))
+            applicationIdSuffix = ".preview"
+            versionNameSuffix = "-preview"
+            signingConfig = null
+        }
     }
 
     sourceSets {
         getByName("debug").jniLibs.srcDir("src/debug/jniLibs")
         getByName("release").jniLibs.srcDir("src/release/jniLibs")
         getByName("preview").jniLibs.srcDir("src/preview/jniLibs")
+        getByName("unsignedPreview").jniLibs.srcDir("src/preview/jniLibs")
     }
 
     packaging {
@@ -562,6 +572,7 @@ configure<AppExtension> {
             "debug" -> "xianzhun-debug-v$appVersionName-debug.apk"
             "release" -> "xianzhun-release-v$appVersionName.apk"
             "preview" -> "xianzhun-preview-v$appVersionName.apk"
+            "unsignedPreview" -> "xianzhun-unsigned-preview-v$appVersionName.apk"
             else -> "xianzhun-${buildType.name}-v$appVersionName.apk"
         }
         outputs.all {
@@ -741,7 +752,7 @@ val buildRustPreview by tasks.registering(Exec::class) {
     workingDir = rustProjectDir
 }
 
-tasks.matching { it.name == "mergePreviewJniLibFolders" }.configureEach {
+tasks.matching { it.name == "mergePreviewJniLibFolders" || it.name == "mergeUnsignedPreviewJniLibFolders" }.configureEach {
     dependsOn(buildRustPreview)
 }
 
