@@ -216,12 +216,18 @@ impl UiState {
     // A bad measurement is not a new measurement. Keep a visibly historical
     // needle briefly, revoke live tune immediately and expire even if PCM stalls.
     fn lose_reading(&mut self, now: Instant) {
-        let age = self.last_reading_at.map(|last| now.saturating_duration_since(last));
         self.pending_jump = None;
         self.pending_target = None;
         self.tuned_candidate_target = None;
         self.tuned_candidate_frames = 0;
+        self.mark_historical(now);
+    }
+
+    fn mark_historical(&mut self, now: Instant) {
         self.in_tune = false;
+        self.tuned_candidate_target = None;
+        self.tuned_candidate_frames = 0;
+        let age = self.last_reading_at.map(|last| now.saturating_duration_since(last));
         match age {
             Some(age) if age < READING_HOLD => {
                 let was_fading = self.phase == UiPhase::Fading;
@@ -260,7 +266,13 @@ impl UiState {
             self.changed();
         }
         if self.last_reading_at.is_some_and(|last| now.saturating_duration_since(last) >= LIVE_READING_TIMEOUT) {
-            self.lose_reading(now);
+            // Do not discard fresh candidate evidence merely because the last
+            // *accepted* reading is older. A stalled stream has no fresh PCM.
+            if self.input_status == InputStatus::Stalled {
+                self.pending_target = None;
+                self.pending_jump = None;
+            }
+            self.mark_historical(now);
         }
     }
 
@@ -623,18 +635,6 @@ fn status_for(cents: f32, in_tune: bool, confidence: f32) -> String {
     }
 }
 
-fn level_for(level: f32, confidence: f32) -> String {
-    if confidence < MIN_TUNING_CONFIDENCE {
-        "音高仍在稳定".to_string()
-    } else if level < 0.02 {
-        "声音较弱".to_string()
-    } else if level > 0.55 {
-        "声音较强，请轻拨".to_string()
-    } else {
-        "信号清晰".to_string()
-    }
-}
-
 pub(crate) fn permission_request_should_settle(
     in_flight: bool,
     has_window_focus: bool,
@@ -910,7 +910,7 @@ mod tests {
         let last = ui.last_reading_at.unwrap();
         ui.expire_reading(last + LIVE_READING_TIMEOUT);
         assert!(!ui.in_tune);
-        assert_eq!(ui.phase as u8, UiPhase::Fading as u8);
+        assert!(ui.phase == UiPhase::Fading);
         assert!(ui.needle_cents.is_some());
         ui.expire_reading(last + NEEDLE_HOLD);
         assert!(ui.needle_cents.is_none());
