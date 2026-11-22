@@ -165,6 +165,8 @@ extern "C" {
 struct OverlayViews {
     root: GlobalRef,
     scroll: GlobalRef,
+    body: GlobalRef,
+    hero: GlobalRef,
     action: GlobalRef,
     auto: GlobalRef,
     note: GlobalRef,
@@ -194,7 +196,6 @@ struct AppState {
     views: OverlayViews,
     ui: Mutex<UiState>,
     last_synced: Mutex<Option<SyncedViews>>,
-    last_synced_action_checked: AtomicBool,
     running: AtomicBool,
     resumed: AtomicBool,
     main_loop_active: AtomicBool,
@@ -231,6 +232,8 @@ struct MainLoopContext {
 }
 
 enum PendingInput {
+    Press { x: f32, y: f32 },
+    ClearPress,
     Tap { down_x: f32, down_y: f32, x: f32, y: f32 },
     Scroll { down_x: f32, down_y: f32, delta: f32 },
 }
@@ -252,7 +255,6 @@ impl AppState {
             views,
             ui: Mutex::new(UiState::new()),
             last_synced: Mutex::new(None),
-            last_synced_action_checked: AtomicBool::new(false),
             running: AtomicBool::new(true),
             resumed: AtomicBool::new(false),
             main_loop_active: AtomicBool::new(false),
@@ -336,6 +338,7 @@ impl AppState {
         self.stop_audio();
         self.stop_input();
         self.pending_inputs.lock().unwrap().clear();
+        if let Ok(mut env) = self.vm.attach_current_thread() { self.update_pressed(&mut env, None); }
         if !self.permission_request_in_flight.load(Ordering::SeqCst) {
             self.listening_requested.store(false, Ordering::SeqCst);
             self.ui.lock().unwrap().show_paused();
@@ -485,7 +488,12 @@ impl AppState {
         for event in events {
             if !app.resumed.load(Ordering::SeqCst) { break; }
             match event {
+                PendingInput::Press { x, y } => {
+                    app.update_pressed(env, Some((x, y)));
+                }
+                PendingInput::ClearPress => app.update_pressed(env, None),
                 PendingInput::Tap { down_x, down_y, x, y } => {
+                    app.update_pressed(env, None);
                     let hit = |env: &mut JNIEnv, view: &JObject| {
                         view_contains_point(env, view, down_x, down_y)
                             && view_contains_point(env, view, x, y)
@@ -505,6 +513,7 @@ impl AppState {
                     app.sync_views(env, false);
                 }
                 PendingInput::Scroll { down_x, down_y, delta } => {
+                    app.update_pressed(env, None);
                     if view_contains_point(env, app.views.scroll.as_obj(), down_x, down_y) {
                         let _ = env.call_method(app.views.scroll.as_obj(), "scrollBy", "(II)V",
                             &[JValue::Int(0), JValue::Int(delta.round() as i32)]);
@@ -512,6 +521,14 @@ impl AppState {
                     }
                 }
             }
+        }
+    }
+
+    fn update_pressed(&self, env: &mut JNIEnv, point: Option<(f32, f32)>) {
+        for view in std::iter::once(&self.views.action).chain(std::iter::once(&self.views.auto)).chain(self.views.chips.iter()) {
+            let pressed = point.is_some_and(|(x, y)| view_contains_point(env, view.as_obj(), x, y));
+            let _ = env.call_method(view.as_obj(), "setPressed", "(Z)V", &[JValue::Bool(jboolean::from(pressed))]);
+            clear_exception(env);
         }
     }
 
@@ -829,10 +846,10 @@ impl AppState {
     }
 
     fn sync_views(&self, env: &mut JNIEnv, force: bool) {
-        let action_checked = self.listening_requested.load(Ordering::SeqCst);
-        let action_enabled = !self.permission_request_in_flight.load(Ordering::SeqCst);
         let mut last_synced = self.last_synced.lock().unwrap();
         let ui = self.ui.lock().unwrap();
+        let action_checked = self.listening_requested.load(Ordering::SeqCst);
+        let action_enabled = !self.permission_request_in_flight.load(Ordering::SeqCst);
         if !force
             && last_synced.as_ref().is_some_and(|last| {
                 last.snapshot.revision == ui.revision
@@ -1081,8 +1098,6 @@ impl AppState {
         });
         clear_exception(env);
         if sync_result.is_ok() {
-            self.last_synced_action_checked
-                .store(action_checked, Ordering::SeqCst);
             *last_synced = Some(SyncedViews {
                 snapshot,
                 action_checked,
@@ -1288,11 +1303,11 @@ fn read_audio_record(
     let mut samples = vec![0_i16; FRAME_SIZE];
     let mut filled = 0;
     let mut target_epoch = app.ui.lock().unwrap().target_epoch;
+    let mut skip_window = false;
     let mut analyzer = PitchAnalyzer::default();
     let started_at = Instant::now();
     let mut watchdog = FrameWatchdog::new(Duration::ZERO);
     let mut silence_watchdog = DigitalSilenceWatchdog::new();
-    let mut observed_waveform = false;
     let sdk = android_sdk_version(env);
     let mut mute_checked_at = None;
     let mut system_silenced = false;
@@ -1304,8 +1319,9 @@ fn read_audio_record(
         let now = started_at.elapsed();
         let current_epoch = app.ui.lock().unwrap().target_epoch;
         if current_epoch != target_epoch {
-            // No buffered PCM from the former selection enters the new target.
+            // No analysis-window PCM from the former selection enters the new target.
             filled = 0;
+            skip_window = true; // discard queued recorder PCM from the old selection
             target_epoch = current_epoch;
         }
         if mute_checked_at.is_none_or(|last| now.saturating_sub(last) >= Duration::from_millis(500))
@@ -1318,7 +1334,9 @@ fn read_audio_record(
             mute_checked_at = Some(now);
             if was_silenced != system_silenced {
                 filled = 0;
-                silence_watchdog = DigitalSilenceWatchdog::new();
+                skip_window = !system_silenced;
+                silence_watchdog.observe_frame(now, &[], true, false);
+                // A previously proven source remains proven across system mute.
             }
             if system_silenced {
                 app.show_capture_status(control, true);
@@ -1355,13 +1373,18 @@ fn read_audio_record(
             env.get_short_array_region(&buffer, 0, &mut samples[filled..filled + read_len])?;
             filled += read_len;
             if filled == FRAME_SIZE {
+                if skip_window {
+                    skip_window = false;
+                    filled = 0;
+                    watchdog.frame_received(started_at.elapsed());
+                    continue;
+                }
                 let frame = InputFrame::from_pcm(&samples).expect("complete PCM frame");
-                if !frame.digital_silence && !system_silenced { observed_waveform = true; }
                 let signal = silence_watchdog.observe_frame(
                     now,
                     &samples,
                     system_silenced,
-                    configuration.can_retry_digital_silence() && !observed_waveform,
+                    configuration.can_retry_digital_silence(),
                 );
                 if signal == CaptureSignalStatus::ZeroSignalTimeout {
                     startup_log(
@@ -1442,10 +1465,15 @@ unsafe fn drain_input_queue(
         if AInputEvent_getType(event) == AINPUT_EVENT_TYPE_MOTION {
             handled = 1;
             let action = AMotionEvent_getAction(event) & AMOTION_EVENT_ACTION_MASK;
+            if !matches!(action, AMOTION_EVENT_ACTION_DOWN | AMOTION_EVENT_ACTION_UP | AMOTION_EVENT_ACTION_MOVE | AMOTION_EVENT_ACTION_CANCEL | AMOTION_EVENT_ACTION_POINTER_DOWN | 6) {
+                AInputQueue_finishEvent(queue, event, 0); // hover/scroll accessibility dispatch
+                continue;
+            }
             if AMotionEvent_getPointerCount(event) != 1
                 || action == AMOTION_EVENT_ACTION_POINTER_DOWN
             {
                 gesture.active = false;
+                app.pending_inputs.lock().unwrap().push_back(PendingInput::ClearPress);
                 AInputQueue_finishEvent(queue, event, handled);
                 continue;
             }
@@ -1458,6 +1486,7 @@ unsafe fn drain_input_queue(
                     gesture.down_y = y;
                     gesture.last_y = y;
                     gesture.moved = false;
+                    app.pending_inputs.lock().unwrap().push_back(PendingInput::Press { x, y });
                 }
                 AMOTION_EVENT_ACTION_MOVE if gesture.active => {
                     let total_x = (x - gesture.down_x).abs();
@@ -1497,6 +1526,7 @@ unsafe fn drain_input_queue(
                 }
                 AMOTION_EVENT_ACTION_CANCEL => {
                     gesture.active = false;
+                    app.pending_inputs.lock().unwrap().push_back(PendingInput::ClearPress);
                 }
                 _ => {}
             }
@@ -1754,12 +1784,15 @@ fn create_ui<'local>(
         "(Ljava/lang/CharSequence;)V",
         &[JValue::Object(&root_description_obj)],
     )?;
+    let body = new_linear_layout(env, activity, VERTICAL)?;
+    let body_params = linear_params(env, MATCH_PARENT, 0, Some(1.0), [0; 4])?;
+    add_view(env, &shell, &body, body_params)?;
     let hero = new_linear_layout(env, activity, VERTICAL)?;
     env.call_method(&hero, "setGravity", "(I)V", &[JValue::Int(GRAVITY_CENTER_HORIZONTAL)])?;
-    add_with_height(env, &shell, &hero, MATCH_PARENT, WRAP_CONTENT,
+    add_with_height(env, &body, &hero, MATCH_PARENT, WRAP_CONTENT,
         [dp(12.0), dp(4.0), dp(12.0), dp(3.0)])?;
     let scroll_params = linear_params(env, MATCH_PARENT, 0, Some(1.0), [0; 4])?;
-    add_view(env, &shell, &scroll, scroll_params)?;
+    add_view(env, &body, &scroll, scroll_params)?;
 
     let content = new_linear_layout(env, activity, VERTICAL)?;
     env.call_method(
@@ -2107,6 +2140,8 @@ fn create_ui<'local>(
     Ok(OverlayViews {
         root: env.new_global_ref(&shell)?,
         scroll: env.new_global_ref(&scroll)?,
+        body: env.new_global_ref(&body)?,
+        hero: env.new_global_ref(&hero)?,
         action: env.new_global_ref(&action)?,
         auto: env.new_global_ref(&auto)?,
         note: env.new_global_ref(&note)?,
@@ -2316,24 +2351,6 @@ fn set_toggle_text(env: &mut JNIEnv, view: &JObject, text: &str) -> JniResult<()
     Ok(())
 }
 
-fn set_background_tint(env: &mut JNIEnv, view: &JObject, color: i32) -> JniResult<()> {
-    let tint = env
-        .call_static_method(
-            "android/content/res/ColorStateList",
-            "valueOf",
-            "(I)Landroid/content/res/ColorStateList;",
-            &[JValue::Int(color)],
-        )?
-        .l()?;
-    env.call_method(
-        view,
-        "setBackgroundTintList",
-        "(Landroid/content/res/ColorStateList;)V",
-        &[JValue::Object(&tint)],
-    )?;
-    Ok(())
-}
-
 fn scaled_touch_slop(env: &mut JNIEnv, activity: &JObject) -> Option<f32> {
     let result = (|| -> JniResult<f32> {
         let configuration = env
@@ -2439,7 +2456,7 @@ fn set_tactile_background(
     Ok(())
 }
 
-fn responsive_dial_width(env: &mut JNIEnv, activity: &JObject, density: f32) -> i32 {
+fn display_size(env: &mut JNIEnv, activity: &JObject, density: f32) -> (i32, i32) {
     let metrics = (|| -> JniResult<(i32, i32)> {
         let resources = env.call_method(activity, "getResources", "()Landroid/content/res/Resources;", &[])?.l()?;
         let metrics = env.call_method(&resources, "getDisplayMetrics", "()Landroid/util/DisplayMetrics;", &[])?.l()?;
@@ -2447,9 +2464,18 @@ fn responsive_dial_width(env: &mut JNIEnv, activity: &JObject, density: f32) -> 
             env.get_field(&metrics, "heightPixels", "I")?.i()?))
     })();
     clear_exception(env);
-    let (width, height) = metrics.unwrap_or(((360.0*density) as i32, (700.0*density) as i32));
+    metrics.unwrap_or(((360.0*density) as i32, (700.0*density) as i32))
+}
+
+fn wide_body(width: i32, height: i32, density: f32) -> bool {
+    width > height && width as f32 / density >= 520.0
+}
+
+fn responsive_dial_width(env: &mut JNIEnv, activity: &JObject, density: f32) -> i32 {
+    let (width, height) = display_size(env, activity, density);
     let side = (40.0*density).round() as i32;
-    (width - side).min((height as f32 * 0.46).round() as i32)
+    let available_width = if wide_body(width, height, density) { width / 2 } else { width };
+    (available_width - side).min((height as f32 * 0.46).round() as i32)
         .min((320.0*density) as i32).max(1)
 }
 
@@ -2470,6 +2496,27 @@ fn dial_label_params<'local>(env: &mut JNIEnv<'local>, cents: f32, width: i32) -
 
 fn resize_dial(env: &mut JNIEnv, app: &AppState) -> JniResult<()> {
     let density = display_density(env, app.activity.as_obj()).max(1.0);
+    let (screen_w, screen_h) = display_size(env, app.activity.as_obj(), density);
+    let wide = wide_body(screen_w, screen_h, density);
+    let dp = |v: f32| (v * density).round() as i32;
+    env.call_method(app.views.body.as_obj(), "setOrientation", "(I)V",
+        &[JValue::Int(if wide { HORIZONTAL } else { VERTICAL })])?;
+    let hero_params = linear_params(env, if wide { 0 } else { MATCH_PARENT }, WRAP_CONTENT,
+        if wide { Some(1.0) } else { None }, [dp(12.0), dp(4.0), dp(12.0), dp(3.0)])?;
+    let scroll_params = linear_params(env, if wide { 0 } else { MATCH_PARENT },
+        if wide { MATCH_PARENT } else { 0 }, Some(1.0), [0; 4])?;
+    for (view, params) in [(&app.views.hero, hero_params), (&app.views.scroll, scroll_params)] {
+        env.call_method(view.as_obj(), "setLayoutParams", "(Landroid/view/ViewGroup$LayoutParams;)V",
+            &[JValue::Object(&params)])?;
+    }
+    for (view, h) in [(&app.views.note, if wide { 38.0 } else { 52.0 }),
+        (&app.views.cents, if wide { 26.0 } else { 32.0 })] {
+        let params = env.call_method(view.as_obj(), "getLayoutParams",
+            "()Landroid/view/ViewGroup$LayoutParams;", &[])?.l()?;
+        env.set_field(&params, "height", "I", JValue::Int(dp(h)))?;
+        env.call_method(view.as_obj(), "setLayoutParams", "(Landroid/view/ViewGroup$LayoutParams;)V",
+            &[JValue::Object(&params)])?;
+    }
     let width = responsive_dial_width(env, app.activity.as_obj(), density);
     let scale = width as f32 / dial::WIDTH;
     let h = (dial::HEIGHT * scale).round() as i32;
@@ -2805,6 +2852,7 @@ pub unsafe extern "C" fn ANativeActivity_onCreate(
     };
 
     let app = AppState::new(vm, activity_ref, views);
+    if resize_dial(&mut env, &app).is_err() { clear_exception(&mut env); }
     app.sync_views(&mut env, true);
     AppState::start_main_loop(&app);
     (*activity).instance = Box::into_raw(Box::new(app)) as *mut c_void;
@@ -2870,6 +2918,8 @@ unsafe extern "C" fn on_input_queue_destroyed(
 unsafe extern "C" fn on_configuration_changed(activity: *mut ANativeActivity) {
     if let Some(app) = app_from_activity(activity) {
         if let Ok(mut env) = app.vm.attach_current_thread() {
+            app.pending_inputs.lock().unwrap().clear();
+            app.update_pressed(&mut env, None);
             if resize_dial(&mut env, &app).is_err() { clear_exception(&mut env); }
             app.sync_views(&mut env, true);
         }
